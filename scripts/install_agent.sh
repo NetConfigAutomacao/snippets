@@ -53,7 +53,7 @@ cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 version: "3"
 services:
   agent:
-    image: netconfigsup/agent:v1.12.1
+    image: netconfigsup/agent:latest
     container_name: netconfig_agent
     environment:
       HOST: "0.0.0.0" # Listen on IPv4; use "::" for IPv6
