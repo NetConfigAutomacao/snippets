@@ -138,7 +138,7 @@ EOF
       openssl req -x509 -nodes -newkey rsa:4096 \
         -keyout "$SELF_SIGNED_KEY.tmp" \
         -out "$SELF_SIGNED_CRT.tmp" \
-        -days 365 \
+        -days 1095 \
         -config "$OPENSSL_CFG" >/dev/null 2>&1
       mv "$SELF_SIGNED_KEY.tmp" "$SELF_SIGNED_KEY"
       mv "$SELF_SIGNED_CRT.tmp" "$SELF_SIGNED_CRT"
@@ -176,17 +176,16 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=netconfig"
       - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:80"
-      - "--entryPoints.websecure.address=:443"
-      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
-      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entryPoints.web.address=:8080"
+      - "--entryPoints.websecure.address=:8443"
+      - "--entryPoints.acme.address=:80"
       - "--certificatesresolvers.le.acme.email=__ACME_EMAIL__"
       - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=acme"
     ports:
       - "80:80"
-      - "443:443"
       - "8080:8080"
+      - "8443:8443"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
@@ -243,12 +242,11 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=netconfig"
       - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:80"
-      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.web.address=:8080"
+      - "--entryPoints.websecure.address=:8443"
     ports:
-      - "80:80"
-      - "443:443"
       - "8080:8080"
+      - "8443:8443"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
@@ -302,9 +300,8 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=netconfig"
       - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:80"
+      - "--entryPoints.web.address=:8080"
     ports:
-      - "80:80"
       - "8080:8080"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
@@ -367,8 +364,13 @@ echo "Container is healthy. Fetching authentication keys..."
 API_KEY=$(docker exec netconfig_agent cat /data/api_key)
 SSH_KEY=$(docker exec netconfig_agent cat /data/tunnel_ssh_key)
 
-echo "API Key: $API_KEY"
-echo "SSH Key: $SSH_KEY"
+echo
+echo "API Key:"
+echo "$API_KEY"
+echo
+echo "SSH Key:"
+echo "$SSH_KEY"
+echo
 
 echo "Register this Agent at https://app.netconfig.com.br/tunnels using the keys above."
 echo "After registration, visit https://app.netconfig.com.br/enterprise/settings and select the newly created Agent."
