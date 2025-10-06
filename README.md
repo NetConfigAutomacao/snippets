@@ -1,18 +1,19 @@
-# NetConfig Repository
+# NetConfig Snippets
 
-This repository contains **scripts, documentation, and resources** related to NetConfig.
-It serves as a centralized place to store utilities, share knowledge, and support daily operations.
+Coleção de scripts e utilitários mantidos pela equipe NetConfig.Automaçao.
 
-## 📂 Contents
+## Conteúdo
 
-- **Scripts**: Automation, helpers, and utilities.
-- **Docs**: Configuration guides, how-tos, and best practices.
-- **Resources**: References and additional materials.
+- **Agent Installer** – automatiza a instalação do NetConfig Agent (Docker + Traefik + certificados). Documentação completa em [`agent/README.md`](agent/README.md).
 
-## 🚀 Install the NetConfig Agent
+## Uso rápido do Agent Installer
 
-Run the installer directly with `curl`:
+Para instalar direto sem clonar o repositório:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/heads/main/scripts/install_agent.sh | sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/heads/main/agent/install.sh | sh
 ```
+
+> Prefira executar o comando como root ou adicione `sudo` antes de `sh`.
+
+Outros componentes serão documentados em diretórios próprios à medida que forem adicionados.
