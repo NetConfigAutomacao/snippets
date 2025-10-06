@@ -1,74 +1,92 @@
 # NetConfig Agent Installer
 
-Este repositório contém o instalador automatizado do NetConfig Agent. O script `scripts/install_agent.sh` provisiona Docker, Traefik e o próprio agente em uma máquina Debian/Ubuntu, garantindo conectividade IPv4/IPv6 e oferecendo múltiplas opções de HTTPS.
+Este repositório disponibiliza o instalador automatizado do NetConfig Agent. O script `scripts/install_agent.sh` prepara Docker, Traefik e o próprio agente em hosts Debian/Ubuntu, habilitando conectividade IPv4/IPv6 e oferecendo três modos de exposição HTTP/HTTPS.
 
-A seguir descrevemos como executar o instalador em três cenários: somente HTTP, HTTPS com certificado autoassinado e HTTPS automático via Let's Encrypt.
+## Instalação Rápida
+
+Escolha a forma que preferir para executar o instalador (sempre como **root** ou com `sudo`).
+
+**Via repo local**
+```bash
+git clone https://github.com/NetConfigAutomacao/snippets.git
+cd snippets
+sudo scripts/install_agent.sh
+```
+
+**Via one-liner**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/heads/main/scripts/install_agent.sh | sh
+```
+> Acrescente `sudo` antes de `sh` caso não esteja executando como root.
 
 ## Pré-requisitos
 
-- Máquina com Debian ou derivado, com acesso root (`sudo`).
-- DNS apontado para o host caso deseje Let’s Encrypt.
-- Portas 8080 (HTTP), 8443 (HTTPS) e 2222 liberadas para acesso ao agente.
-- Para emissão automática via Let's Encrypt, mantenha a porta 80 acessível (usada apenas para o desafio ACME).
+- Host Debian/Ubuntu (ou derivado) com privilégios de root.
+- Conectividade com a internet para instalar pacotes e baixar imagens Docker.
+- Portas liberadas:
+  - `8080/tcp` (HTTP do agente via Traefik)
+  - `8443/tcp` (HTTPS do agente via Traefik)
+  - `2222/tcp` (túnel SSH do agente)
+  - `80/tcp` (apenas para o desafio ACME quando Let’s Encrypt estiver ativo)
+- DNS apontando para o host caso vá utilizar Let’s Encrypt.
 
-## Execução sem HTTPS (somente HTTP)
+## Modos de operação
 
-Use quando apenas acesso local/teste é necessário e você não quer TLS.
+O script detecta automaticamente o cenário desejado. Execute o instalador e siga as instruções abaixo conforme sua necessidade.
 
-1. Faça login como root ou utilize `sudo`.
-2. Rode:
-   ```bash
-   sudo scripts/install_agent.sh DISABLE_TLS=true
-   ```
-3. O instalador irá:
-   - Atualizar pacotes, instalar `curl`, `openssl` (se faltarem) e Docker.
-   - Criar o stack Docker com Traefik ouvindo apenas em `:8080`.
-   - Expor o agente na porta 8080 via Traefik e manter a porta 2222 para SSH.
-4. Acesse o painel em `http://<IP ou hostname>:8080`.
-5. Ao final, o script exibirá `API Key` e `SSH Key` para registrar o agente em https://app.netconfig.com.br.
+### 1. Somente HTTP (sem TLS)
+Use quando TLS não é necessário (testes ou ambientes internos).
 
-## HTTPS com certificado autoassinado (sem domínio)
+```bash
+sudo scripts/install_agent.sh DISABLE_TLS=true
+```
 
-Padrão quando você não define domínio/email. Ideal para ambiente que exige TLS mas ainda sem DNS pronto.
+O instalador:
+- Atualiza pacotes e instala `curl`, `openssl` e Docker, caso precisem.
+- Sobe o stack Docker com Traefik escutando apenas em `:8080`.
+- Publica o NetConfig Agent em `http://<host>:8080` e mantém o túnel `2222/tcp`.
 
-1. Execute como root/sudo:
-   ```bash
-   sudo scripts/install_agent.sh
-   ```
-2. Quando perguntado *“Enable HTTPS via Traefik? [Y/n]”*, pressione Enter (aceitar).
-3. Se não informar domínio/email, o script:
-   - Gera certificado autoassinado (`/opt/netconfig-agent/traefik/certs/selfsigned.{crt,key}`) com SAN para `localhost`, `127.0.0.1` e IP primário do host (validade de 3 anos).
-   - Configura Traefik para servir HTTP em `:8080` e HTTPS em `:8443` utilizando esse certificado.
-4. Acesse via `http://<IP ou hostname>:8080` ou `https://<IP ou hostname>:8443`; o navegador avisará que o certificado é não confiável — importe o `.crt` caso deseje remover o aviso.
-5. Dashboard permanece disponível internamente; exponha-o via Traefik se necessário.
-6. Chaves de registro (`API Key`, `SSH Key`) são exibidas ao final.
+No final, o script exibirá as chaves de registro (`API Key` e `SSH Key`) com espaçamento extra para facilitar a cópia.
 
-## HTTPS automático com Let's Encrypt (domínio + e-mail)
+### 2. HTTPS com certificado autoassinado (padrão)
+Este é o comportamento padrão quando você aceita habilitar HTTPS, mas não informa domínio/e-mail.
 
-Use quando o host já responde pelo seu domínio público.
+Passos:
+1. Execute `sudo scripts/install_agent.sh` (ou o one-liner).
+2. Quando perguntado “Enable HTTPS via Traefik? [Y/n]”, pressione **Enter** para aceitar.
+3. Deixe os campos de domínio/e-mail vazios para usar o certificado autoassinado.
 
-1. Verifique que `DOMÍNIO -> IP` já está resolvendo e que as portas 8080, 8443 e 80 (para o desafio ACME) estão abertas.
-2. Execute o instalador informando as variáveis de ambiente:
-   ```bash
-   sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com scripts/install_agent.sh
-   ```
-   - Alternativamente, rode `sudo scripts/install_agent.sh`, aceite HTTPS e informe domínio/e-mail quando solicitado.
-3. O script:
-   - Pré-cria `traefik/acme/acme.json` (permissões 600) para armazenar certificados.
-   - Atende o desafio ACME via porta 80 dedicada (`entrypoint acme`) e emite o certificado pelo resolver `le`.
-   - Define as labels do serviço do agente apontando para o domínio informado.
-4. Acesse `http://agent.exemplo.com:8080` (HTTP) ou `https://agent.exemplo.com:8443` (HTTPS); o certificado deve ser válido (emitido por Let’s Encrypt).
-5. A porta 80 permanece reservada para renovações automáticas do ACME.
-6. Registre o agente com as chaves apresentadas ao final.
+O instalador irá:
+- Gerar um certificado autoassinado válido por **3 anos** em `/opt/netconfig-agent/traefik/certs/selfsigned.{crt,key}`, incluindo SAN para `localhost`, `127.0.0.1` e o IP principal do host.
+- Configurar Traefik para servir:
+  - `http://<host>:8080`
+  - `https://<host>:8443`
+- Manter o arquivo `selfsigned.yml` na pasta dinâmica do Traefik.
 
-## Comandos úteis pós-instalação
+Importe o `.crt` no seu trust store para evitar avisos do navegador. Em execuções não interativas (ex.: via automação), o script habilita HTTPS com o mesmo certificado autoassinado por padrão; use `DISABLE_TLS=true` caso não deseje TLS.
 
-- Ver estado dos containers:
+### 3. HTTPS automático com Let’s Encrypt
+Requer um domínio público já apontado para o host.
+
+```bash
+sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com scripts/install_agent.sh
+```
+> Você também pode rodar sem variáveis, aceitar HTTPS no prompt e informar domínio/e-mail quando solicitado.
+
+O instalador:
+- Cria `/opt/netconfig-agent/traefik/acme/acme.json` (permissões 600) para armazenar certificados.
+- Abre um entrypoint exclusivo `acme=:80` para o desafio HTTP do Let’s Encrypt (resolver `le`).
+- Gera o stack com Traefik servindo o agente em `http://agent.exemplo.com:8080` e `https://agent.exemplo.com:8443`, usando o certificado emitido automaticamente.
+- Mantém a porta 80 reservada para renovações futuras.
+
+## Pós-instalação
+
+- Checar status dos containers:
   ```bash
   cd /opt/netconfig-agent
   sudo docker compose ps
   ```
-- Reiniciar stack:
+- Reiniciar o stack:
   ```bash
   sudo docker compose restart
   ```
@@ -76,7 +94,7 @@ Use quando o host já responde pelo seu domínio público.
   ```bash
   sudo docker logs -f netconfig_agent
   ```
-- Atualizar imagem do agente:
+- Atualizar a imagem do agente:
   ```bash
   cd /opt/netconfig-agent
   sudo docker compose pull
@@ -89,18 +107,18 @@ Use quando o host já responde pelo seu domínio público.
 /opt/netconfig-agent/
 ├── docker-compose.yml
 ├── traefik/
-│   ├── acme/acme.json           # Apenas no modo Let's Encrypt
+│   ├── acme/acme.json           # Apenas no modo Let’s Encrypt
 │   ├── certs/selfsigned.*       # Apenas no modo autoassinado
-│   └── dynamic/selfsigned.yml   # Configuração TLS dinâmica
+│   └── dynamic/selfsigned.yml   # Referência ao certificado self-signed
 └── agent_data/                  # Persistência do NetConfig Agent
 ```
 
 ## Solução de problemas
 
-- **Certificado Let’s Encrypt não emite**: confirme DNS, portas liberadas e ausência de proxies filtrando HTTP.
-- **Certificado autoassinado não é aceito**: importe `/opt/netconfig-agent/traefik/certs/selfsigned.crt` no trust store.
-- **Portas em uso**: encerre serviços que ocupam 80/8080/8443/2222 antes de rodar o instalador.
+- **Let’s Encrypt não gera certificado**: verifique DNS, liberação das portas 80/8080/8443 e se nenhum outro serviço está ocupando-as.
+- **Aviso de certificado inválido**: importe `/opt/netconfig-agent/traefik/certs/selfsigned.crt` no trust store (modo autoassinado).
+- **Porta em uso**: finalize serviços que utilizem 80, 8080, 8443 ou 2222 antes de reexecutar o instalador.
 
 ## Suporte
 
-Dúvidas adicionais? Registre o agente pelo painel e contate o suporte NetConfig informando o `API Key`.
+Registre o agente em https://app.netconfig.com.br/tunnels usando as chaves exibidas ao final e, se precisar de ajuda, contate o suporte NetConfig informando o `API Key` correspondente.
