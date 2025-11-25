@@ -165,7 +165,7 @@ if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
     cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 services:
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6.1
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
