@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env sh
 
 set -eu
 
@@ -39,7 +39,28 @@ if [ -f "$DOCKER_CONFIG_FILE" ]; then
   if grep -q '"ip6tables"[[:space:]]*:[[:space:]]*true' "$DOCKER_CONFIG_FILE" 2>/dev/null; then
     echo "Docker IPv6 support already enabled."
   else
-    echo "Docker daemon config already exists. Please ensure IPv6 is enabled manually in $DOCKER_CONFIG_FILE."
+    echo "Warning: Docker daemon config exists but IPv6 support is not enabled."
+    echo "IPv6 is required for this agent to work properly."
+    if command -v jq >/dev/null 2>&1; then
+      echo "Attempting to enable IPv6 in existing config..."
+      TEMP_CONFIG=$(mktemp)
+      jq '. + {"experimental": true, "ip6tables": true}' "$DOCKER_CONFIG_FILE" > "$TEMP_CONFIG"
+      mv "$TEMP_CONFIG" "$DOCKER_CONFIG_FILE"
+      systemctl restart docker
+      echo "IPv6 support enabled and Docker restarted."
+    else
+      echo "Please manually add the following to $DOCKER_CONFIG_FILE:"
+      echo '  "experimental": true,'
+      echo '  "ip6tables": true'
+      echo "Then restart Docker with: systemctl restart docker"
+      if [ -t 0 ]; then
+        read -r -p "Continue without enabling IPv6 automatically? [y/N] " continue_answer || true
+        if ! printf '%s' "${continue_answer:-}" | grep -iq '^y'; then
+          echo "Installation aborted. Please configure IPv6 and re-run this script."
+          exit 1
+        fi
+      fi
+    fi
   fi
 else
   echo "Enabling IPv6 support for Docker..."
@@ -52,6 +73,17 @@ EOF
   systemctl restart docker
 fi
 
+validate_domain() {
+  if [ -z "$1" ]; then
+    return 0
+  fi
+  if ! echo "$1" | grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'; then
+    echo "Warning: '$1' does not appear to be a valid domain name."
+    return 1
+  fi
+  return 0
+}
+
 DOMAIN="${DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 TRAEFIK_ENABLE_TLS="false"
@@ -60,8 +92,13 @@ USE_ACME="false"
 if [ "${DISABLE_TLS:-}" = "true" ]; then
   echo "HTTPS disabled via DISABLE_TLS environment variable."
 elif [ -n "$DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
-  TRAEFIK_ENABLE_TLS="true"
-  USE_ACME="true"
+  if validate_domain "$DOMAIN"; then
+    TRAEFIK_ENABLE_TLS="true"
+    USE_ACME="true"
+  else
+    echo "Invalid domain provided. Please provide a valid domain or leave it empty for self-signed certificate."
+    exit 1
+  fi
 else
   if [ -t 0 ]; then
     echo "Enable HTTPS via Traefik? [Y/n]"
@@ -74,7 +111,12 @@ else
         read -r -p "Email for Let's Encrypt notifications (optional): " ACME_EMAIL || true
       fi
       if [ -n "$DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
-        USE_ACME="true"
+        if validate_domain "$DOMAIN"; then
+          USE_ACME="true"
+        else
+          echo "Invalid domain format. Using self-signed certificate instead."
+          DOMAIN=""
+        fi
       else
         echo "Using a self-signed certificate because DOMAIN or ACME_EMAIL is missing."
       fi
@@ -105,9 +147,11 @@ if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
     touch "$TRAEFIK_DIR/acme/acme.json"
     chmod 600 "$TRAEFIK_DIR/acme/acme.json"
     rm -f "$TRAEFIK_DIR/dynamic/selfsigned.yml"
+    rm -rf "$TRAEFIK_DIR/certs"
   else
     CERT_DIR="$TRAEFIK_DIR/certs"
     mkdir -p "$CERT_DIR"
+    rm -rf "$TRAEFIK_DIR/acme"
     SELF_SIGNED_CRT="$CERT_DIR/selfsigned.crt"
     SELF_SIGNED_KEY="$CERT_DIR/selfsigned.key"
     if [ ! -f "$SELF_SIGNED_CRT" ] || [ ! -f "$SELF_SIGNED_KEY" ]; then
@@ -131,7 +175,7 @@ subjectAltName = @alt_names
 DNS.1 = localhost
 IP.1 = 127.0.0.1
 EOF
-      host_ip=$(hostname -I 2>/dev/null | awk '{print $1}') || host_ip=""
+      host_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}') || host_ip=""
       if [ -n "$host_ip" ]; then
         printf 'IP.2 = %s\n' "$host_ip" >> "$OPENSSL_CFG"
       fi
@@ -157,6 +201,28 @@ EOF
   fi
 else
   rm -f "$TRAEFIK_DIR/dynamic/selfsigned.yml"
+  rm -rf "$TRAEFIK_DIR/certs"
+  rm -rf "$TRAEFIK_DIR/acme"
+fi
+
+COMPOSE_MODE=""
+if command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_MODE="docker-compose"
+  echo "Detected docker-compose..."
+elif docker compose version >/dev/null 2>&1; then
+  COMPOSE_MODE="docker compose"
+  echo "Detected docker compose plugin..."
+else
+  echo "Error: docker-compose or docker compose not found."
+  exit 1
+fi
+
+if [ -f "$AGENT_DIR/docker-compose.yml" ]; then
+  echo "Existing docker-compose.yml found. Stopping containers..."
+  PREV_DIR=$(pwd)
+  cd "$AGENT_DIR"
+  sh -c "$COMPOSE_MODE down" || true
+  cd "$PREV_DIR"
 fi
 
 echo "Writing docker-compose.yml to $AGENT_DIR..."
@@ -208,7 +274,7 @@ services:
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(`/`)"
       - "traefik.http.routers.netconfig-http.entrypoints=web"
       - "traefik.http.routers.netconfig-http.service=netconfig"
-      - "traefik.http.routers.netconfig-https.rule=Host(\"__DOMAIN__\")"
+      - "traefik.http.routers.netconfig-https.rule=Host(`__DOMAIN__`)"
       - "traefik.http.routers.netconfig-https.entrypoints=websecure"
       - "traefik.http.routers.netconfig-https.tls.certresolver=le"
       - "traefik.http.routers.netconfig-https.service=netconfig"
@@ -231,7 +297,7 @@ EOF
     cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 services:
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6.1
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
@@ -289,7 +355,7 @@ else
   cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 services:
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6.1
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
@@ -337,32 +403,42 @@ networks:
 EOF
 fi
 
-COMPOSE_MODE=""
-if command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE_MODE="docker-compose"
-  echo "Using docker-compose..."
-elif docker compose version >/dev/null 2>&1; then
-  COMPOSE_MODE="docker compose"
-  echo "Using docker compose plugin..."
-else
-  echo "Error: docker-compose or docker compose not found."
+echo "Starting the NetConfig Agent containers..."
+cd "$AGENT_DIR"
+if ! sh -c "$COMPOSE_MODE up -d --pull always"; then
+  echo "Error: Failed to start containers with docker compose."
   exit 1
 fi
 
-echo "Starting the NetConfig Agent containers..."
-cd "$AGENT_DIR"
-sh -c "$COMPOSE_MODE up -d"
-
 echo "Waiting for the container to report as healthy..."
-until docker inspect --format '{{.State.Health.Status}}' netconfig_agent | grep -q "healthy"; do
-  echo "Container not healthy yet. Retrying in 5 seconds..."
+MAX_WAIT=300
+WAIT_TIME=0
+until docker inspect --format '{{.State.Health.Status}}' netconfig_agent 2>/dev/null | grep -q "healthy"; do
+  if [ $WAIT_TIME -ge $MAX_WAIT ]; then
+    echo "Error: Container did not become healthy within ${MAX_WAIT} seconds."
+    echo "Check container logs with: docker logs netconfig_agent"
+    exit 1
+  fi
+  echo "Container not healthy yet. Retrying in 5 seconds... ($WAIT_TIME/${MAX_WAIT}s)"
   sleep 5
+  WAIT_TIME=$((WAIT_TIME + 5))
 done
 
 echo "Container is healthy. Fetching authentication keys..."
 
-API_KEY=$(docker exec netconfig_agent cat /data/api_key)
-SSH_KEY=$(docker exec netconfig_agent cat /data/tunnel_ssh_key)
+API_KEY=$(docker exec netconfig_agent cat /data/api_key 2>/dev/null)
+if [ -z "$API_KEY" ]; then
+  echo "Error: Failed to retrieve API key from container."
+  echo "Check container logs with: docker logs netconfig_agent"
+  exit 1
+fi
+
+SSH_KEY=$(docker exec netconfig_agent cat /data/tunnel_ssh_key 2>/dev/null)
+if [ -z "$SSH_KEY" ]; then
+  echo "Error: Failed to retrieve SSH key from container."
+  echo "Check container logs with: docker logs netconfig_agent"
+  exit 1
+fi
 
 echo
 echo "API Key:"
