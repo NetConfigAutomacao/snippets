@@ -2,6 +2,34 @@
 
 set -eu
 
+UNATTENDED=false
+for arg in "$@"; do
+  case "$arg" in
+    --unattended|--no-prompt|--no-ask|-y)
+      UNATTENDED=true
+      ;;
+    --help|-h)
+      echo "Usage: $0 [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --unattended, --no-prompt, --no-ask, -y"
+      echo "                    Run installation without interactive prompts"
+      echo "  --help, -h        Show this help message"
+      echo ""
+      echo "Environment variables:"
+      echo "  DOMAIN            Domain name for Let's Encrypt (optional)"
+      echo "  ACME_EMAIL        Email for Let's Encrypt notifications (optional)"
+      echo "  DISABLE_TLS       Set to 'true' to disable HTTPS (optional)"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "This installer must run as root (tip: use sudo)."
   exit 1
@@ -36,38 +64,35 @@ fi
 
 DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 if [ -f "$DOCKER_CONFIG_FILE" ]; then
-  if grep -q '"ip6tables"[[:space:]]*:[[:space:]]*true' "$DOCKER_CONFIG_FILE" 2>/dev/null; then
+  if grep -q '"ipv6"[[:space:]]*:[[:space:]]*true' "$DOCKER_CONFIG_FILE" 2>/dev/null; then
     echo "Docker IPv6 support already enabled."
   else
-    echo "Warning: Docker daemon config exists but IPv6 support is not enabled."
-    echo "IPv6 is required for this agent to work properly."
+    echo "Docker daemon config exists but IPv6 support is not enabled."
+    echo "Enabling IPv6 support (backing up existing config)..."
     if command -v jq >/dev/null 2>&1; then
-      echo "Attempting to enable IPv6 in existing config..."
       TEMP_CONFIG=$(mktemp)
-      jq '. + {"experimental": true, "ip6tables": true}' "$DOCKER_CONFIG_FILE" > "$TEMP_CONFIG"
+      jq '. + {"ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64"}' "$DOCKER_CONFIG_FILE" > "$TEMP_CONFIG"
       mv "$TEMP_CONFIG" "$DOCKER_CONFIG_FILE"
-      systemctl restart docker
-      echo "IPv6 support enabled and Docker restarted."
     else
-      echo "Please manually add the following to $DOCKER_CONFIG_FILE:"
-      echo '  "experimental": true,'
-      echo '  "ip6tables": true'
-      echo "Then restart Docker with: systemctl restart docker"
-      if [ -t 0 ]; then
-        read -r -p "Continue without enabling IPv6 automatically? [y/N] " continue_answer || true
-        if ! printf '%s' "${continue_answer:-}" | grep -iq '^y'; then
-          echo "Installation aborted. Please configure IPv6 and re-run this script."
-          exit 1
-        fi
-      fi
+      BACKUP_FILE="${DOCKER_CONFIG_FILE}.backup.$(date +%s)"
+      cp "$DOCKER_CONFIG_FILE" "$BACKUP_FILE"
+      echo "Original config backed up to: $BACKUP_FILE"
+      cat > "$DOCKER_CONFIG_FILE" <<'EOF'
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "2001:db8:1::/64"
+}
+EOF
     fi
+    systemctl restart docker
+    echo "IPv6 support enabled and Docker restarted."
   fi
 else
   echo "Enabling IPv6 support for Docker..."
   cat > "$DOCKER_CONFIG_FILE" <<'EOF'
 {
-  "experimental": true,
-  "ip6tables": true
+  "ipv6": true,
+  "fixed-cidr-v6": "2001:db8:1::/64"
 }
 EOF
   systemctl restart docker
@@ -100,7 +125,11 @@ elif [ -n "$DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
     exit 1
   fi
 else
-  if [ -t 0 ]; then
+  if [ "$UNATTENDED" = "true" ]; then
+    TRAEFIK_ENABLE_TLS="true"
+    echo "Running in unattended mode. HTTPS will use a self-signed certificate."
+    echo "To use Let's Encrypt, set DOMAIN and ACME_EMAIL environment variables."
+  elif [ -t 0 ]; then
     echo "Enable HTTPS via Traefik? [Y/n]"
     echo "Provide DOMAIN and ACME_EMAIL for Let's Encrypt; leave blank to use a self-signed certificate."
     read -r _answer || true
