@@ -3,10 +3,14 @@
 set -eu
 
 UNATTENDED=false
+AGENT_TAG="latest"
 for arg in "$@"; do
   case "$arg" in
     --unattended|--no-prompt|--no-ask|-y)
       UNATTENDED=true
+      ;;
+    --dev)
+      AGENT_TAG="dev"
       ;;
     --help|-h)
       echo "Usage: $0 [OPTIONS]"
@@ -14,11 +18,13 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --unattended, --no-prompt, --no-ask, -y"
       echo "                    Run installation without interactive prompts"
+      echo "  --dev             Use dev tag for agent image (default: latest)"
       echo "  --help, -h        Show this help message"
       echo ""
       echo "Environment variables:"
       echo "  DOMAIN            Domain name for Let's Encrypt (optional)"
       echo "  ACME_EMAIL        Email for Let's Encrypt notifications (optional)"
+      echo "  BACKEND_URL       NetConfig backend URL (default: https://app.netconfig.com.br/api)"
       echo "  DISABLE_TLS       Set to 'true' to disable HTTPS (optional)"
       exit 0
       ;;
@@ -111,6 +117,7 @@ validate_domain() {
 
 DOMAIN="${DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
+BACKEND_URL="${BACKEND_URL:-https://app.netconfig.com.br/api}"
 TRAEFIK_ENABLE_TLS="false"
 USE_ACME="false"
 
@@ -131,10 +138,10 @@ else
     echo "To use Let's Encrypt, set DOMAIN and ACME_EMAIL environment variables."
   elif [ -t 0 ]; then
     echo "Enable HTTPS via Traefik? [Y/n]"
-    echo "Provide DOMAIN and ACME_EMAIL for Let's Encrypt; leave blank to use a self-signed certificate."
     read -r _answer || true
     if ! printf '%s' "${_answer:-}" | grep -iq '^n'; then
       TRAEFIK_ENABLE_TLS="true"
+      echo "Provide DOMAIN and ACME_EMAIL for Let's Encrypt; leave blank to use a self-signed certificate."
       if [ -z "$DOMAIN" ] || [ -z "$ACME_EMAIL" ]; then
         read -r -p "Domain that points to this agent (optional): " DOMAIN || true
         read -r -p "Email for Let's Encrypt notifications (optional): " ACME_EMAIL || true
@@ -169,6 +176,14 @@ if [ ! -d "$TRAEFIK_DIR" ]; then
   echo "Preparing Traefik configuration directories..."
 fi
 mkdir -p "$TRAEFIK_DIR/dynamic"
+
+API_KEY=$(openssl rand -hex 32)
+
+cat > "$AGENT_DIR/.env" <<EOF
+API_KEY=$API_KEY
+BACKEND_URL=$BACKEND_URL
+EOF
+chmod 600 "$AGENT_DIR/.env"
 
 if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
   if [ "$USE_ACME" = "true" ]; then
@@ -289,12 +304,10 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:__AGENT_TAG__
     container_name: netconfig_agent
-    ports:
-      - "2222:2222"
-    volumes:
-      - agent_data:/data
+    env_file:
+      - .env
     networks:
       - local
     labels:
@@ -309,9 +322,6 @@ services:
       - "traefik.http.routers.netconfig-https.service=netconfig"
     restart: unless-stopped
 
-volumes:
-  agent_data:
-
 networks:
   local:
     name: netconfig
@@ -322,6 +332,7 @@ EOF
     domain_escaped=$(printf '%s' "$DOMAIN" | sed 's/[\\/&]/\\&/g')
     sed -i "s/__ACME_EMAIL__/$email_escaped/g" "$AGENT_DIR/docker-compose.yml"
     sed -i "s/__DOMAIN__/$domain_escaped/g" "$AGENT_DIR/docker-compose.yml"
+    sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
   else
     cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 services:
@@ -350,12 +361,10 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:__AGENT_TAG__
     container_name: netconfig_agent
-    ports:
-      - "2222:2222"
-    volumes:
-      - agent_data:/data
+    env_file:
+      - .env
     networks:
       - local
     labels:
@@ -370,15 +379,13 @@ services:
       - "traefik.http.routers.netconfig-https.service=netconfig"
     restart: unless-stopped
 
-volumes:
-  agent_data:
-
 networks:
   local:
     name: netconfig
     driver: bridge
     enable_ipv6: true
 EOF
+    sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
   fi
 else
   cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
@@ -405,12 +412,10 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:__AGENT_TAG__
     container_name: netconfig_agent
-    ports:
-      - "2222:2222"
-    volumes:
-      - agent_data:/data
+    env_file:
+      - .env
     networks:
       - local
     labels:
@@ -421,15 +426,13 @@ services:
       - "traefik.http.routers.netconfig-http.service=netconfig"
     restart: unless-stopped
 
-volumes:
-  agent_data:
-
 networks:
   local:
     name: netconfig
     driver: bridge
     enable_ipv6: true
 EOF
+  sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
 fi
 
 echo "Starting the NetConfig Agent containers..."
@@ -453,31 +456,12 @@ until docker inspect --format '{{.State.Health.Status}}' netconfig_agent 2>/dev/
   WAIT_TIME=$((WAIT_TIME + 5))
 done
 
-echo "Container is healthy. Fetching authentication keys..."
-
-API_KEY=$(docker exec netconfig_agent cat /data/api_key 2>/dev/null)
-if [ -z "$API_KEY" ]; then
-  echo "Error: Failed to retrieve API key from container."
-  echo "Check container logs with: docker logs netconfig_agent"
-  exit 1
-fi
-
-SSH_KEY=$(docker exec netconfig_agent cat /data/tunnel_ssh_key 2>/dev/null)
-if [ -z "$SSH_KEY" ]; then
-  echo "Error: Failed to retrieve SSH key from container."
-  echo "Check container logs with: docker logs netconfig_agent"
-  exit 1
-fi
-
 echo
 echo "API Key:"
 echo "$API_KEY"
 echo
-echo "SSH Key:"
-echo "$SSH_KEY"
-echo
 
-echo "Register this Agent at https://app.netconfig.com.br/tunnels using the keys above."
+echo "Register this Agent at https://app.netconfig.com.br/agent using the API Key above."
 echo "After registration, visit https://app.netconfig.com.br/enterprise/settings and select the newly created Agent."
 
 echo "Installation and configuration completed successfully."
