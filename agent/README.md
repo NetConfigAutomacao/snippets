@@ -10,7 +10,7 @@ Execute o instalador como **root** ou com `sudo`, escolhendo a abordagem que pre
 ```bash
 git clone https://github.com/NetConfigAutomacao/snippets.git
 cd snippets
-sudo agent/install.sh
+sudo ./agent/install.sh
 ```
 
 **Via one-liner**
@@ -26,7 +26,6 @@ curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/he
 - Portas liberadas:
   - `8080/tcp` (HTTP do agente via Traefik)
   - `8443/tcp` (HTTPS do agente via Traefik)
-  - `2222/tcp` (túnel SSH do agente)
   - `80/tcp` (utilizada pelo desafio ACME ao usar Let's Encrypt)
 - DNS apontando para o host caso vá utilizar Let’s Encrypt.
 
@@ -38,7 +37,7 @@ O instalador identifica automaticamente o cenário desejado com base nas variáv
 Adequado para ambientes de teste ou redes internas onde TLS não é necessário.
 
 ```bash
-sudo agent/install.sh DISABLE_TLS=true
+DISABLE_TLS=true sudo agent/install.sh
 ```
 
 O instalador:
@@ -46,7 +45,7 @@ O instalador:
 - Sobe o stack Docker com Traefik escutando apenas em `:8080`.
 - Publica o NetConfig Agent em `http://<host>:8080` e mantém o túnel `2222/tcp`.
 
-Ao término, as chaves de registro (`API Key` e `SSH Key`) são exibidas com espaçamento extra para facilitar a cópia.
+Ao término, a `API Key` é exibida com espaçamento extra para facilitar a cópia.
 
 ### 2. HTTPS com certificado autoassinado (padrão)
 Padrão quando HTTPS é aceito mas nenhum domínio/e-mail é informado.
@@ -106,11 +105,11 @@ O instalador:
 ```
 /opt/netconfig-agent/
 ├── docker-compose.yml
-├── traefik/
-│   ├── acme/acme.json           # Apenas no modo Let’s Encrypt
-│   ├── certs/selfsigned.*       # Apenas no modo autoassinado
-│   └── dynamic/selfsigned.yml   # Referência ao certificado self-signed
-└── agent_data/                  # Persistência do NetConfig Agent
+├── .env                         # Variáveis de ambiente (API_KEY, BACKEND_URL)
+└── traefik/
+    ├── acme/acme.json           # Apenas no modo Let's Encrypt
+    ├── certs/selfsigned.*       # Apenas no modo autoassinado
+    └── dynamic/selfsigned.yml   # Referência ao certificado self-signed
 ```
 
 ## Solução de problemas
@@ -121,4 +120,4 @@ O instalador:
 
 ## Suporte
 
-Registre o agente em https://app.netconfig.com.br/tunnels usando as chaves exibidas ao final e, se precisar de ajuda, contate o suporte NetConfig informando o `API Key` correspondente.
+Registre o agente em https://app.netconfig.com.br/agent usando a API Key exibida ao final e, se precisar de ajuda, contate o suporte NetConfig informando o `API Key` correspondente.
