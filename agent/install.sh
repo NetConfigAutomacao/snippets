@@ -3,14 +3,10 @@
 set -eu
 
 UNATTENDED=false
-AGENT_TAG="latest"
 for arg in "$@"; do
   case "$arg" in
     --unattended|--no-prompt|--no-ask|-y)
       UNATTENDED=true
-      ;;
-    --dev)
-      AGENT_TAG="dev"
       ;;
     --help|-h)
       echo "Usage: $0 [OPTIONS]"
@@ -18,7 +14,6 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --unattended, --no-prompt, --no-ask, -y"
       echo "                    Run installation without interactive prompts"
-      echo "  --dev             Use dev tag for agent image (default: latest)"
       echo "  --help, -h        Show this help message"
       echo ""
       echo "Environment variables:"
@@ -304,7 +299,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:__AGENT_TAG__
+    image: netconfigsup/agent:latest
     container_name: netconfig_agent
     env_file:
       - .env
@@ -313,10 +308,10 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
-      - "traefik.http.routers.netconfig-http.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
       - "traefik.http.routers.netconfig-http.entrypoints=web"
       - "traefik.http.routers.netconfig-http.service=netconfig"
-      - "traefik.http.routers.netconfig-https.rule=Host(`__DOMAIN__`)"
+      - "traefik.http.routers.netconfig-https.rule=Host(\`__DOMAIN__\`)"
       - "traefik.http.routers.netconfig-https.entrypoints=websecure"
       - "traefik.http.routers.netconfig-https.tls.certresolver=le"
       - "traefik.http.routers.netconfig-https.service=netconfig"
@@ -332,7 +327,6 @@ EOF
     domain_escaped=$(printf '%s' "$DOMAIN" | sed 's/[\\/&]/\\&/g')
     sed -i "s/__ACME_EMAIL__/$email_escaped/g" "$AGENT_DIR/docker-compose.yml"
     sed -i "s/__DOMAIN__/$domain_escaped/g" "$AGENT_DIR/docker-compose.yml"
-    sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
   else
     cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
 services:
@@ -361,7 +355,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:__AGENT_TAG__
+    image: netconfigsup/agent:latest
     container_name: netconfig_agent
     env_file:
       - .env
@@ -370,10 +364,10 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
-      - "traefik.http.routers.netconfig-http.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
       - "traefik.http.routers.netconfig-http.entrypoints=web"
       - "traefik.http.routers.netconfig-http.service=netconfig"
-      - "traefik.http.routers.netconfig-https.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.netconfig-https.rule=PathPrefix(\`/\`)"
       - "traefik.http.routers.netconfig-https.entrypoints=websecure"
       - "traefik.http.routers.netconfig-https.tls=true"
       - "traefik.http.routers.netconfig-https.service=netconfig"
@@ -385,7 +379,6 @@ networks:
     driver: bridge
     enable_ipv6: true
 EOF
-    sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
   fi
 else
   cat > "$AGENT_DIR/docker-compose.yml" <<'EOF'
@@ -412,7 +405,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:__AGENT_TAG__
+    image: netconfigsup/agent:latest
     container_name: netconfig_agent
     env_file:
       - .env
@@ -421,7 +414,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
-      - "traefik.http.routers.netconfig-http.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
       - "traefik.http.routers.netconfig-http.entrypoints=web"
       - "traefik.http.routers.netconfig-http.service=netconfig"
     restart: unless-stopped
@@ -432,7 +425,6 @@ networks:
     driver: bridge
     enable_ipv6: true
 EOF
-  sed -i "s/__AGENT_TAG__/$AGENT_TAG/g" "$AGENT_DIR/docker-compose.yml"
 fi
 
 echo "Starting the NetConfig Agent containers..."
