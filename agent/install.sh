@@ -19,11 +19,14 @@ readonly WAIT_INTERVAL=5
 # =============================================================================
 
 UNATTENDED=false
+NO_INSTALL_VM_DOCKER=false
+NO_UPDATE_VM=false
 DOMAIN=""
 ACME_EMAIL=""
 TRAEFIK_ENABLE_TLS=false
 USE_ACME=false
 COMPOSE_MODE=""
+AGENT_TAG="latest"
 
 # =============================================================================
 # Logging Functions
@@ -94,6 +97,21 @@ parse_arguments() {
                 UNATTENDED=true
                 shift
                 ;;
+            --no-install-vm-docker)
+                NO_INSTALL_VM_DOCKER=true
+                shift
+                ;;
+            --no-update-vm)
+                NO_UPDATE_VM=true
+                shift
+                ;;
+            --tag)
+                if [ -z "${2:-}" ]; then
+                    die "Option --tag requires a value (e.g., --tag v1.23.1)"
+                fi
+                AGENT_TAG="$2"
+                shift 2
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -112,6 +130,11 @@ Usage: install.sh [OPTIONS]
 Options:
   --unattended, --no-prompt, --no-ask, -y
                     Run installation without interactive prompts
+  --no-install-vm-docker
+                    Do not install Docker or dependencies (curl, openssl).
+                    Check if they are installed, fail if not.
+  --no-update-vm    Skip system package update (apt-get update/upgrade)
+  --tag VERSION     Specify agent image tag (default: latest)
   --help, -h        Show this help message
 
 Environment variables:
@@ -513,7 +536,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
     ports:
       - "2222:2222"
@@ -574,7 +597,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
     ports:
       - "2222:2222"
@@ -647,7 +670,7 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:latest
+    image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
     ports:
       - "2222:2222"

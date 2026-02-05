@@ -42,6 +42,7 @@ O script aceita as seguintes flags de linha de comando:
 | `--unattended`, `--no-prompt`, `--no-ask`, `-y` | Executa sem prompts interativos. Usa valores padrão (HTTPS com certificado autoassinado).                                                                                               |
 | `--no-install-vm-docker`                        | **Não instala** Docker, curl ou openssl. Apenas verifica se estão instalados. Se algum estiver faltando, o script para com erro. Útil quando você gerencia as dependências manualmente. |
 | `--no-update-vm`                                | Pula `apt-get update && apt-get upgrade`. Ainda instala dependências se necessário (a menos que `--no-install-vm-docker` também esteja ativa).                                          |
+| `--tag VERSION`                                 | Especifica a tag da imagem do agente (padrão: `latest`). Exemplo: `--tag v1.23.1`                                                                                                       |
 | `--help`, `-h`                                  | Exibe mensagem de ajuda e sai.                                                                                                                                                          |
 
 ### Exemplos com flags
@@ -55,6 +56,12 @@ sudo agent/install.sh --no-install-vm-docker --no-update-vm
 
 # Modo silencioso com Let's Encrypt
 sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com agent/install.sh --unattended
+
+# Instalar versão específica do agente
+sudo agent/install.sh --tag v1.23.1
+
+# Versão específica com Let's Encrypt
+sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com agent/install.sh --tag v1.23.1
 ```
 
 ## Execução não-interativa
