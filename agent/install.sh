@@ -21,6 +21,7 @@ readonly WAIT_INTERVAL=5
 UNATTENDED=false
 NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
+REINSTALL=false
 DOMAIN=""
 ACME_EMAIL=""
 TRAEFIK_ENABLE_TLS=false
@@ -97,6 +98,10 @@ parse_arguments() {
                 UNATTENDED=true
                 shift
                 ;;
+            --reinstall)
+                REINSTALL=true
+                shift
+                ;;
             --no-install-vm-docker)
                 NO_INSTALL_VM_DOCKER=true
                 shift
@@ -130,6 +135,9 @@ Usage: install.sh [OPTIONS]
 Options:
   --unattended, --no-prompt, --no-ask, -y
                     Run installation without interactive prompts
+  --reinstall        Wipe existing NetConfig Agent installation (containers,
+                    volume data, and files under /opt/netconfig-agent) and
+                    run the installation again (DESTRUCTIVE)
   --no-install-vm-docker
                     Do not install Docker or dependencies (curl, openssl).
                     Check if they are installed, fail if not.
@@ -149,12 +157,16 @@ EOF
 # =============================================================================
 
 install_dependencies() {
-    log_info "Updating system packages..."
-    apt-get update -y && apt-get upgrade -y
+     if [ "$NO_UPDATE_VM" = "true" ]; then
+         log_info "Skipping system update (NO_UPDATE_VM=true)."
+     else
+     log_info "Updating system packages..."
+     apt-get update -y && apt-get upgrade -y
+     fi
 
-    install_package "curl"
-    install_package "openssl"
-    install_docker
+     install_package "curl"
+     install_package "openssl"
+     install_docker
 }
 
 install_package() {
@@ -481,6 +493,106 @@ detect_compose_mode() {
     fi
 }
 
+detect_compose_mode_optional() {
+    COMPOSE_MODE=""
+
+    if command_exists docker-compose; then
+        COMPOSE_MODE="docker-compose"
+        return 0
+    fi
+
+    if command_exists docker && docker compose version >/dev/null 2>&1; then
+        COMPOSE_MODE="docker compose"
+        return 0
+    fi
+
+    return 1
+}
+
+# =============================================================================
+# Reinstall / Wipe
+# =============================================================================
+
+confirm_reinstall() {
+    if [ "$UNATTENDED" = "true" ]; then
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        die "--reinstall needs a TTY for confirmation. Use --unattended to skip prompts."
+    fi
+
+    log_warn "--reinstall will REMOVE the existing NetConfig Agent installation."
+    log_warn "This includes Docker containers, the agent data volume (/data), and files in: $AGENT_DIR"
+    printf "Continue with wipe + reinstall? [y/N] "
+    read -r answer || true
+
+    if ! printf '%s' "${answer:-}" | grep -iq '^y'; then
+        die "Aborted by user."
+    fi
+}
+
+get_agent_data_volume_from_container() {
+    # Prints the Docker volume name backing /data for netconfig_agent, if present.
+    # Best-effort only; empty output means "not found".
+    docker inspect -f '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/data")}}{{.Name}}{{end}}{{end}}' netconfig_agent 2>/dev/null || true
+}
+
+wipe_previous_installation() {
+    confirm_reinstall
+
+    if command_exists docker; then
+        log_info "Removing existing NetConfig Agent containers/volumes (if any)..."
+
+        local agent_volume
+        local project
+        local agent_image
+        local traefik_image
+        agent_volume="$(get_agent_data_volume_from_container)"
+        project="$(basename "$AGENT_DIR" 2>/dev/null || true)"
+        agent_image="netconfigsup/agent:${AGENT_TAG}"
+        traefik_image="traefik:${TRAEFIK_VERSION}"
+
+        if [ -f "$AGENT_DIR/docker-compose.yml" ]; then
+            if detect_compose_mode_optional; then
+                (
+                    cd "$AGENT_DIR" || exit 0
+                    $COMPOSE_MODE down -v --remove-orphans || true
+                )
+            fi
+        fi
+
+        docker rm -f netconfig_agent netconfig_traefik >/dev/null 2>&1 || true
+
+        if [ -n "${agent_volume:-}" ]; then
+            docker volume rm "$agent_volume" >/dev/null 2>&1 || true
+        fi
+
+        # Best-effort: remove any leftover compose volumes for this project.
+        if [ -n "${project:-}" ]; then
+            for v in $(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true); do
+                docker volume rm "$v" >/dev/null 2>&1 || true
+            done
+        fi
+
+        docker network rm netconfig >/dev/null 2>&1 || true
+
+        log_info "Removing related Docker images (best-effort)..."
+        docker image rm -f "$agent_image" >/dev/null 2>&1 || true
+        docker image rm -f "$traefik_image" >/dev/null 2>&1 || true
+
+        # Also remove any remaining tags for the NetConfig Agent repository.
+        for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^netconfigsup/agent:' || true); do
+            docker image rm -f "$img" >/dev/null 2>&1 || true
+        done
+    fi
+
+    if [ -d "$AGENT_DIR" ]; then
+        log_info "Removing files under $AGENT_DIR..."
+        rm -rf "$AGENT_DIR"
+    fi
+}
+
 # =============================================================================
 # Docker Compose Generation
 # =============================================================================
@@ -788,7 +900,19 @@ main() {
 
     parse_arguments "$@"
     check_root
-    install_dependencies
+
+    if [ "$REINSTALL" = "true" ]; then
+        wipe_previous_installation
+    fi
+
+    if [ "$NO_INSTALL_VM_DOCKER" = "true" ]; then
+        log_info "Skipping Docker/dependency installation (NO_INSTALL_VM_DOCKER=true)."
+        command_exists curl || die "curl not found and --no-install-vm-docker was set. Install curl and retry."
+        command_exists openssl || die "openssl not found and --no-install-vm-docker was set. Install openssl and retry."
+        command_exists docker || die "docker not found and --no-install-vm-docker was set. Install docker and retry."
+    else
+        install_dependencies
+    fi
     configure_docker_ipv6
     configure_tls
     setup_directories
