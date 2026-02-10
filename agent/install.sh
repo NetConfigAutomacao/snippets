@@ -650,6 +650,11 @@ services:
   agent:
     image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "2222:2222"
     volumes:
@@ -711,6 +716,11 @@ services:
   agent:
     image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "2222:2222"
     volumes:
@@ -784,6 +794,11 @@ services:
   agent:
     image: netconfigsup/agent:${AGENT_TAG}
     container_name: netconfig_agent
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "2222:2222"
     volumes:
