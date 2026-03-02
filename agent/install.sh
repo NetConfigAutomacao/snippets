@@ -910,11 +910,25 @@ display_keys() {
 # Main Function
 # =============================================================================
 
+check_distro() {
+    if [ ! -f /etc/os-release ]; then
+        die "Cannot detect distribution (/etc/os-release not found). This installer only supports Debian and Ubuntu."
+    fi
+
+    . /etc/os-release
+
+    case "${ID:-}" in
+        debian|ubuntu) ;;
+        *) die "Unsupported distribution: ${ID:-unknown}. This installer only supports Debian and Ubuntu." ;;
+    esac
+}
+
 main() {
     log_info "Starting NetConfig Agent installation..."
 
     parse_arguments "$@"
     check_root
+    check_distro
 
     if [ "$REINSTALL" = "true" ]; then
         wipe_previous_installation
