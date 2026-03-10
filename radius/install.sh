@@ -6,7 +6,7 @@ set -eu
 # NetConfig Radius Installer
 # =============================================================================
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly TRAEFIK_VERSION="v3.6.1"
 readonly RADIUS_DIR="/opt/netconfig-radius"
 readonly TRAEFIK_DIR="${RADIUS_DIR}/traefik"
@@ -22,10 +22,6 @@ UNATTENDED=false
 NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
 REINSTALL=false
-DOMAIN=""
-ACME_EMAIL=""
-TRAEFIK_ENABLE_TLS=false
-USE_ACME=false
 COMPOSE_MODE=""
 RADIUS_API_TAG="latest"
 RADIUS_SERVER_TAG="latest"
@@ -67,25 +63,6 @@ check_root() {
 
 generate_password() {
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32
-}
-
-# =============================================================================
-# Validation Functions
-# =============================================================================
-
-validate_domain() {
-    local domain="$1"
-
-    if [ -z "$domain" ]; then
-        return 0
-    fi
-
-    if ! printf '%s' "$domain" | grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'; then
-        log_warn "'$domain' does not appear to be a valid domain name."
-        return 1
-    fi
-
-    return 0
 }
 
 # =============================================================================
@@ -156,9 +133,6 @@ Options:
   --help, -h        Show this help message
 
 Environment variables:
-  DOMAIN            Domain name for Let's Encrypt (optional)
-  ACME_EMAIL        Email for Let's Encrypt notifications (optional)
-  DISABLE_TLS       Set to 'true' to disable HTTPS (optional)
   RADIUS_API_KEY    Pre-defined API key (optional, auto-generated if empty)
 EOF
 }
@@ -207,98 +181,6 @@ install_docker() {
 }
 
 # =============================================================================
-# TLS Configuration
-# =============================================================================
-
-configure_tls() {
-    DOMAIN="${DOMAIN:-}"
-    ACME_EMAIL="${ACME_EMAIL:-}"
-
-    if [ "${DISABLE_TLS:-}" = "true" ]; then
-        log_info "HTTPS disabled via DISABLE_TLS environment variable."
-        TRAEFIK_ENABLE_TLS=false
-        USE_ACME=false
-        return 0
-    fi
-
-    if [ -n "$DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
-        configure_tls_from_env
-    elif [ "$UNATTENDED" = "true" ]; then
-        configure_tls_unattended
-    elif [ -t 0 ]; then
-        configure_tls_interactive
-    else
-        configure_tls_default
-    fi
-}
-
-configure_tls_from_env() {
-    if validate_domain "$DOMAIN"; then
-        TRAEFIK_ENABLE_TLS=true
-        USE_ACME=true
-        log_info "Using Let's Encrypt with domain: $DOMAIN"
-    else
-        die "Invalid domain provided. Please provide a valid domain or leave it empty for self-signed certificate."
-    fi
-}
-
-configure_tls_unattended() {
-    TRAEFIK_ENABLE_TLS=true
-    USE_ACME=false
-    log_info "Running in unattended mode. HTTPS will use a self-signed certificate."
-    log_info "To use Let's Encrypt, set DOMAIN and ACME_EMAIL environment variables."
-}
-
-configure_tls_interactive() {
-    printf "Enable HTTPS via Traefik? [Y/n] "
-    read -r answer || true
-
-    if printf '%s' "${answer:-}" | grep -iq '^n'; then
-        log_info "Skipping HTTPS configuration."
-        TRAEFIK_ENABLE_TLS=false
-        USE_ACME=false
-        return 0
-    fi
-
-    TRAEFIK_ENABLE_TLS=true
-    printf "\nTo use Let's Encrypt, provide DOMAIN and ACME_EMAIL.\n"
-    printf "Leave both blank to use a self-signed certificate.\n\n"
-
-    read_domain_and_email
-    determine_acme_usage
-}
-
-read_domain_and_email() {
-    printf "Domain that points to this radius server (optional): "
-    read -r DOMAIN || true
-
-    printf "Email for Let's Encrypt notifications (optional): "
-    read -r ACME_EMAIL || true
-}
-
-determine_acme_usage() {
-    if [ -n "$DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
-        if validate_domain "$DOMAIN"; then
-            USE_ACME=true
-            log_info "Using Let's Encrypt for SSL certificates."
-        else
-            log_warn "Invalid domain format. Using self-signed certificate instead."
-            DOMAIN=""
-            USE_ACME=false
-        fi
-    else
-        USE_ACME=false
-        log_info "Using a self-signed certificate because DOMAIN or ACME_EMAIL is missing."
-    fi
-}
-
-configure_tls_default() {
-    TRAEFIK_ENABLE_TLS=true
-    USE_ACME=false
-    log_info "No domain/email provided. HTTPS will use a self-signed certificate. Set DISABLE_TLS=true to skip."
-}
-
-# =============================================================================
 # Directory Setup
 # =============================================================================
 
@@ -316,40 +198,11 @@ setup_directories() {
 # =============================================================================
 
 setup_certificates() {
-    if [ "$TRAEFIK_ENABLE_TLS" != "true" ]; then
-        cleanup_cert_directories
-        return 0
-    fi
-
-    if [ "$USE_ACME" = "true" ]; then
-        setup_acme_certificates
-    else
-        setup_self_signed_certificates
-    fi
-}
-
-cleanup_cert_directories() {
-    rm -f "$TRAEFIK_DIR/dynamic/selfsigned.yml"
-    rm -rf "$TRAEFIK_DIR/certs"
-    rm -rf "$TRAEFIK_DIR/acme"
-}
-
-setup_acme_certificates() {
-    mkdir -p "$TRAEFIK_DIR/acme"
-    touch "$TRAEFIK_DIR/acme/acme.json"
-    chmod 600 "$TRAEFIK_DIR/acme/acme.json"
-
-    rm -f "$TRAEFIK_DIR/dynamic/selfsigned.yml"
-    rm -rf "$TRAEFIK_DIR/certs"
-}
-
-setup_self_signed_certificates() {
     local cert_dir="$TRAEFIK_DIR/certs"
     local self_signed_crt="$cert_dir/selfsigned.crt"
     local self_signed_key="$cert_dir/selfsigned.key"
 
     mkdir -p "$cert_dir"
-    rm -rf "$TRAEFIK_DIR/acme"
 
     if [ -f "$self_signed_crt" ] && [ -f "$self_signed_key" ]; then
         log_info "Self-signed certificate already exists."
@@ -547,13 +400,50 @@ generate_docker_compose() {
 
     log_info "Writing docker-compose.yml to $RADIUS_DIR..."
 
-    if [ "$TRAEFIK_ENABLE_TLS" != "true" ]; then
-        generate_compose_no_tls
-    elif [ "$USE_ACME" = "true" ]; then
-        generate_compose_acme
-    else
-        generate_compose_self_signed
-    fi
+    {
+        compose_header
+
+        cat <<EOF
+  traefik:
+    image: traefik:${TRAEFIK_VERSION}
+    container_name: netconfig_radius_traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=radius-internal"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--entryPoints.websecure.address=:9443"
+    ports:
+      - "9443:9443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./traefik/dynamic:/etc/traefik/dynamic:ro"
+      - "./traefik/certs:/etc/traefik/certs:ro"
+    networks:
+      - radius-internal
+
+EOF
+        compose_db_service
+        printf '\n'
+
+        compose_api_service
+        cat <<'EOF'
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.radius-api.loadbalancer.server.port=8000"
+      - "traefik.http.routers.radius-https.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.radius-https.entrypoints=websecure"
+      - "traefik.http.routers.radius-https.tls=true"
+      - "traefik.http.routers.radius-https.service=radius-api"
+
+EOF
+        compose_server_service
+        printf '\n'
+        compose_volumes_and_networks
+    } > "$RADIUS_DIR/docker-compose.yml"
 }
 
 stop_existing_containers() {
@@ -642,178 +532,6 @@ networks:
 EOF
 }
 
-# --- No TLS ---
-
-generate_compose_no_tls() {
-    {
-        compose_header
-
-        cat <<EOF
-  traefik:
-    image: traefik:${TRAEFIK_VERSION}
-    container_name: netconfig_radius_traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    command:
-      - "--api.dashboard=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=radius-internal"
-      - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:8080"
-    ports:
-      - "8080:8080"
-    volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./traefik/dynamic:/etc/traefik/dynamic:ro"
-    networks:
-      - radius-internal
-
-EOF
-        compose_db_service
-        printf '\n'
-
-        compose_api_service
-        cat <<'EOF'
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.services.radius-api.loadbalancer.server.port=8000"
-      - "traefik.http.routers.radius-http.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.radius-http.entrypoints=web"
-      - "traefik.http.routers.radius-http.service=radius-api"
-
-EOF
-        compose_server_service
-        printf '\n'
-        compose_volumes_and_networks
-    } > "$RADIUS_DIR/docker-compose.yml"
-}
-
-# --- Self-signed TLS ---
-
-generate_compose_self_signed() {
-    {
-        compose_header
-
-        cat <<EOF
-  traefik:
-    image: traefik:${TRAEFIK_VERSION}
-    container_name: netconfig_radius_traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    command:
-      - "--api.dashboard=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=radius-internal"
-      - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:8080"
-      - "--entryPoints.websecure.address=:8443"
-    ports:
-      - "8080:8080"
-      - "8443:8443"
-    volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./traefik/dynamic:/etc/traefik/dynamic:ro"
-      - "./traefik/certs:/etc/traefik/certs:ro"
-    networks:
-      - radius-internal
-
-EOF
-        compose_db_service
-        printf '\n'
-
-        compose_api_service
-        cat <<'EOF'
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.services.radius-api.loadbalancer.server.port=8000"
-      - "traefik.http.routers.radius-http.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.radius-http.entrypoints=web"
-      - "traefik.http.routers.radius-http.service=radius-api"
-      - "traefik.http.routers.radius-https.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.radius-https.entrypoints=websecure"
-      - "traefik.http.routers.radius-https.tls=true"
-      - "traefik.http.routers.radius-https.service=radius-api"
-
-EOF
-        compose_server_service
-        printf '\n'
-        compose_volumes_and_networks
-    } > "$RADIUS_DIR/docker-compose.yml"
-}
-
-# --- ACME (Let's Encrypt) ---
-
-generate_compose_acme() {
-    local email_escaped
-    local domain_escaped
-
-    {
-        compose_header
-
-        cat <<EOF
-  traefik:
-    image: traefik:${TRAEFIK_VERSION}
-    container_name: netconfig_radius_traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    command:
-      - "--api.dashboard=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=radius-internal"
-      - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--entryPoints.web.address=:8080"
-      - "--entryPoints.websecure.address=:8443"
-      - "--entryPoints.acme.address=:80"
-      - "--certificatesresolvers.le.acme.email=__ACME_EMAIL__"
-      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=acme"
-    ports:
-      - "80:80"
-      - "8080:8080"
-      - "8443:8443"
-    volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./traefik/dynamic:/etc/traefik/dynamic:ro"
-      - "./traefik/acme:/letsencrypt"
-    networks:
-      - radius-internal
-
-EOF
-        compose_db_service
-        printf '\n'
-
-        compose_api_service
-        cat <<EOF
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.services.radius-api.loadbalancer.server.port=8000"
-      - "traefik.http.routers.radius-http.rule=PathPrefix(\`/\`)"
-      - "traefik.http.routers.radius-http.entrypoints=web"
-      - "traefik.http.routers.radius-http.service=radius-api"
-      - "traefik.http.routers.radius-https.rule=Host(\`__DOMAIN__\`)"
-      - "traefik.http.routers.radius-https.entrypoints=websecure"
-      - "traefik.http.routers.radius-https.tls.certresolver=le"
-      - "traefik.http.routers.radius-https.service=radius-api"
-
-EOF
-        compose_server_service
-        printf '\n'
-        compose_volumes_and_networks
-    } > "$RADIUS_DIR/docker-compose.yml"
-
-    email_escaped=$(printf '%s' "$ACME_EMAIL" | sed 's/[\\/&]/\\&/g')
-    domain_escaped=$(printf '%s' "$DOMAIN" | sed 's/[\\/&]/\\&/g')
-
-    sed -i "s/__ACME_EMAIL__/$email_escaped/g" "$RADIUS_DIR/docker-compose.yml"
-    sed -i "s/__DOMAIN__/$domain_escaped/g" "$RADIUS_DIR/docker-compose.yml"
-}
-
 # =============================================================================
 # Deployment
 # =============================================================================
@@ -864,11 +582,7 @@ display_credentials() {
     printf '\n'
     printf 'RADIUS Authentication: UDP port 1812\n'
     printf 'RADIUS Accounting:     UDP port 1813\n'
-
-    if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
-        printf 'RADIUS API (HTTPS):    port 8443\n'
-    fi
-    printf 'RADIUS API (HTTP):     port 8080\n'
+    printf 'RADIUS API (HTTPS):    port 9443\n'
     printf '\n'
 }
 
@@ -908,7 +622,6 @@ main() {
     else
         install_dependencies
     fi
-    configure_tls
     setup_directories
     setup_certificates
     setup_credentials
