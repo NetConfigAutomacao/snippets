@@ -6,7 +6,7 @@ set -eu
 # NetConfig Radius Installer
 # =============================================================================
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly TRAEFIK_VERSION="v3.6.1"
 readonly RADIUS_DIR="/opt/netconfig-radius"
 readonly TRAEFIK_DIR="${RADIUS_DIR}/traefik"
@@ -23,8 +23,7 @@ NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
 REINSTALL=false
 COMPOSE_MODE=""
-RADIUS_API_TAG="latest"
-RADIUS_SERVER_TAG="latest"
+RADIUS_TAG="latest"
 
 # =============================================================================
 # Logging Functions
@@ -88,18 +87,11 @@ parse_arguments() {
                 NO_UPDATE_VM=true
                 shift
                 ;;
-            --api-tag)
+            --tag)
                 if [ -z "${2:-}" ]; then
-                    die "Option --api-tag requires a value (e.g., --api-tag v1.0.0)"
+                    die "Option --tag requires a value (e.g., --tag v1.0.0)"
                 fi
-                RADIUS_API_TAG="$2"
-                shift 2
-                ;;
-            --server-tag)
-                if [ -z "${2:-}" ]; then
-                    die "Option --server-tag requires a value (e.g., --server-tag v1.0.0)"
-                fi
-                RADIUS_SERVER_TAG="$2"
+                RADIUS_TAG="$2"
                 shift 2
                 ;;
             --help|-h)
@@ -127,9 +119,8 @@ Options:
                     Do not install Docker or dependencies (curl, openssl).
                     Check if they are installed, fail if not.
   --no-update-vm    Skip system package update (apt-get update/upgrade)
-  --api-tag VERSION Specify radius-api image tag (default: latest)
-  --server-tag VERSION
-                    Specify radius-server image tag (default: latest)
+  --tag VERSION     Specify image tag for radius-db, radius-api,
+                    and radius-server (default: latest)
   --help, -h        Show this help message
 
 Environment variables:
@@ -326,6 +317,18 @@ setup_credentials() {
     log_info "Generated MySQL root password."
 }
 
+write_env_file() {
+    local env_file="$RADIUS_DIR/.env"
+
+    log_info "Writing environment file to $env_file..."
+    umask 077
+    cat > "$env_file" <<EOF
+RADIUS_TAG=${RADIUS_TAG}
+RADIUS_API_KEY=${RADIUS_API_KEY}
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+EOF
+}
+
 # =============================================================================
 # Reinstall / Wipe
 # =============================================================================
@@ -376,11 +379,12 @@ wipe_previous_installation() {
         fi
 
         log_info "Removing related Docker images (best-effort)..."
-        docker image rm -f "netconfigsup/radius-api:${RADIUS_API_TAG}" >/dev/null 2>&1 || true
-        docker image rm -f "netconfigsup/radius-server:${RADIUS_SERVER_TAG}" >/dev/null 2>&1 || true
+        docker image rm -f "netconfigsup/radius-db:${RADIUS_TAG}" >/dev/null 2>&1 || true
+        docker image rm -f "netconfigsup/radius-api:${RADIUS_TAG}" >/dev/null 2>&1 || true
+        docker image rm -f "netconfigsup/radius-server:${RADIUS_TAG}" >/dev/null 2>&1 || true
         docker image rm -f "traefik:${TRAEFIK_VERSION}" >/dev/null 2>&1 || true
 
-        for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^netconfigsup/radius-(api|server):' || true); do
+        for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^netconfigsup/radius-(db|api|server):' || true); do
             docker image rm -f "$img" >/dev/null 2>&1 || true
         done
     fi
@@ -414,6 +418,7 @@ generate_docker_compose() {
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=radius-internal"
+      - '--providers.docker.constraints=Label("radius.stack","true")'
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.websecure.address=:9443"
     ports:
@@ -432,6 +437,8 @@ EOF
         compose_api_service
         cat <<'EOF'
     labels:
+      - "radius.stack=true"
+      - "traefik.docker.network=radius-internal"
       - "traefik.enable=true"
       - "traefik.http.services.radius-api.loadbalancer.server.port=8000"
       - "traefik.http.routers.radius-https.rule=PathPrefix(`/`)"
@@ -467,9 +474,9 @@ EOF
 }
 
 compose_db_service() {
-    cat <<EOF
+    cat <<'EOF'
   radius-db:
-    image: mysql:8.4
+    image: netconfigsup/radius-db:${RADIUS_TAG}
     container_name: netconfig_radius_db
     restart: unless-stopped
     environment:
@@ -487,9 +494,9 @@ EOF
 }
 
 compose_api_service() {
-    cat <<EOF
+    cat <<'EOF'
   radius-api:
-    image: netconfigsup/radius-api:${RADIUS_API_TAG}
+    image: netconfigsup/radius-api:${RADIUS_TAG}
     container_name: netconfig_radius_api
     restart: unless-stopped
     depends_on:
@@ -497,18 +504,20 @@ compose_api_service() {
         condition: service_healthy
     environment:
       RADIUS_API_KEY: ${RADIUS_API_KEY}
-      RADIUS_DB_DSN: raduser:radpass@tcp(radius-db:3306)/raddb?parseTime=true
+      RADIUS_DB_DSN: raduser:radpass@tcp(radius-db:3306)/raddb?parseTime=true&tls=false
       RADIUS_ITEMS_PER_PAGE: 100
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      RADIUS_SERVER_CONTAINER: netconfig_radius_server
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - radius-internal
 EOF
 }
 
 compose_server_service() {
-    cat <<EOF
+    cat <<'EOF'
   radius-server:
-    image: netconfigsup/radius-server:${RADIUS_SERVER_TAG}
+    image: netconfigsup/radius-server:${RADIUS_TAG}
     container_name: netconfig_radius_server
     restart: unless-stopped
     depends_on:
@@ -529,6 +538,7 @@ volumes:
 
 networks:
   radius-internal:
+    name: radius-internal
 EOF
 }
 
@@ -625,6 +635,7 @@ main() {
     setup_directories
     setup_certificates
     setup_credentials
+    write_env_file
     detect_compose_mode
     generate_docker_compose
     deploy_containers
