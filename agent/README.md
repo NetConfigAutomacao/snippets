@@ -43,7 +43,19 @@ O script aceita as seguintes flags de linha de comando:
 | `--no-install-vm-docker`                        | **Não instala** Docker, curl ou openssl. Apenas verifica se estão instalados. Se algum estiver faltando, o script para com erro. Útil quando você gerencia as dependências manualmente. |
 | `--no-update-vm`                                | Pula `apt-get update && apt-get upgrade`. Ainda instala dependências se necessário (a menos que `--no-install-vm-docker` também esteja ativa).                                          |
 | `--tag VERSION`                                 | Especifica a tag da imagem do agente (padrão: `latest`). Exemplo: `--tag v1.23.1`                                                                                                       |
+| `--no-auto-update`                              | Não cria o agendamento automático de atualização em `/etc/cron.d/netconfig`.                                                                                                            |
+| `--update-weekday N`                            | Define o dia da semana do update automático (`0-6`). Deve ser usado junto com `--update-hour` e `--update-minute`.                                                                      |
+| `--update-hour N`                               | Define a hora do update automático (`0-23`). Deve ser usado junto com `--update-weekday` e `--update-minute`.                                                                           |
+| `--update-minute N`                             | Define o minuto do update automático (`0-59`). Deve ser usado junto com `--update-weekday` e `--update-hour`.                                                                           |
 | `--help`, `-h`                                  | Exibe mensagem de ajuda e sai.                                                                                                                                                          |
+
+Se nenhum dos três parâmetros `--update-*` for informado, o instalador escolhe automaticamente:
+
+- dia da semana `0` ou `6`
+- hora entre `3` e `5`
+- minuto entre `0` e `59`
+
+Se um dos parâmetros `--update-*` for informado, os três precisam ser enviados juntos.
 
 ### Exemplos com flags
 
@@ -54,6 +66,9 @@ sudo agent/install.sh --unattended --no-update-vm
 # Apenas verifica dependências, não instala nada
 sudo agent/install.sh --no-install-vm-docker --no-update-vm
 
+# Desabilitar criação do cron de auto update
+sudo agent/install.sh --no-auto-update
+
 # Modo silencioso com Let's Encrypt
 sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com agent/install.sh --unattended
 
@@ -62,6 +77,9 @@ sudo agent/install.sh --tag v1.23.1
 
 # Versão específica com Let's Encrypt
 sudo DOMAIN=agent.exemplo.com ACME_EMAIL=dev@exemplo.com agent/install.sh --tag v1.23.1
+
+# Definir janela fixa para auto update: sábado às 03:15
+sudo agent/install.sh --update-weekday 6 --update-hour 3 --update-minute 15
 ```
 
 ## Execução não-interativa
@@ -174,18 +192,30 @@ O instalador:
   ```bash
   sudo docker logs -f netconfig_agent
   ```
-- Atualizar a imagem do agente:
+- Atualizar a imagem do agente via script:
+  ```bash
+  sudo /opt/netconfig-agent/update.sh
+  ```
+- Logs do auto update:
+  ```bash
+  ls -lah /opt/netconfig-agent/logs/
+  ```
+- Atualizar a imagem do agente manualmente:
   ```bash
   cd /opt/netconfig-agent
   sudo docker compose pull
   sudo docker compose up -d
   ```
 
+Por padrão, o instalador cria `/etc/cron.d/netconfig` para executar o `update.sh` semanalmente. Se o arquivo já existir e nenhum `--update-*` for informado, ele é preservado. Use `--no-auto-update` para não criar esse cron.
+
 ## Estrutura gerada
 
 ```
 /opt/netconfig-agent/
 ├── docker-compose.yml
+├── update.sh
+├── logs/                        # Logs do auto update via cron
 ├── traefik/
 │   ├── acme/acme.json           # Apenas no modo Let's Encrypt
 │   ├── certs/selfsigned.*       # Apenas no modo autoassinado
