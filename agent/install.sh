@@ -11,6 +11,8 @@ readonly TRAEFIK_VERSION="v3.6.1"
 readonly AGENT_DIR="/opt/netconfig-agent"
 readonly TRAEFIK_DIR="${AGENT_DIR}/traefik"
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
+readonly UPDATE_SCRIPT="${AGENT_DIR}/update.sh"
+readonly CRON_FILE="/etc/cron.d/netconfig"
 readonly MAX_WAIT=300
 readonly WAIT_INTERVAL=5
 
@@ -21,6 +23,7 @@ readonly WAIT_INTERVAL=5
 UNATTENDED=false
 NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
+NO_AUTO_UPDATE=false
 REINSTALL=false
 DOMAIN=""
 ACME_EMAIL=""
@@ -28,6 +31,9 @@ TRAEFIK_ENABLE_TLS=false
 USE_ACME=false
 COMPOSE_MODE=""
 AGENT_TAG="latest"
+UPDATE_WEEKDAY="-1"
+UPDATE_HOUR="-1"
+UPDATE_MINUTE="-1"
 
 # =============================================================================
 # Logging Functions
@@ -60,6 +66,22 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+cron_installed() {
+    dpkg -s cron >/dev/null 2>&1
+}
+
+random_int_in_range() {
+    local min="$1"
+    local max="$2"
+    local span
+    local random_value
+
+    span=$((max - min + 1))
+    random_value=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+
+    printf '%s\n' $((min + (random_value % span)))
+}
+
 # Check if running as root
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -85,6 +107,26 @@ validate_domain() {
     fi
 
     return 0
+}
+
+is_integer() {
+    case "$1" in
+        -|''|*[!0-9-]*|*--*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_integer_range() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+    local option_name="$4"
+
+    is_integer "$value" || die "$option_name must be an integer."
+
+    if [ "$value" -ne -1 ] && { [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; }; then
+        die "Option $option_name must be between $min and $max."
+    fi
 }
 
 # =============================================================================
@@ -117,6 +159,25 @@ parse_arguments() {
                 AGENT_TAG="$2"
                 shift 2
                 ;;
+            --no-auto-update)
+                NO_AUTO_UPDATE=true
+                shift
+                ;;
+            --update-weekday)
+                validate_integer_range "$2" 0 6 "--update-weekday"
+                UPDATE_WEEKDAY="$2"
+                shift 2
+                ;;
+            --update-hour)
+                validate_integer_range "$2" 0 23 "--update-hour"
+                UPDATE_HOUR="$2"
+                shift 2
+                ;;
+            --update-minute)
+                validate_integer_range "$2" 0 59 "--update-minute"
+                UPDATE_MINUTE="$2"
+                shift 2
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -126,6 +187,12 @@ parse_arguments() {
                 ;;
         esac
     done
+
+    if [ "$UPDATE_WEEKDAY" -ne -1 ] || [ "$UPDATE_HOUR" -ne -1 ] || [ "$UPDATE_MINUTE" -ne -1 ]; then
+        if [ "$UPDATE_WEEKDAY" -eq -1 ] || [ "$UPDATE_HOUR" -eq -1 ] || [ "$UPDATE_MINUTE" -eq -1 ]; then
+            die "If one update schedule option is provided, --update-weekday, --update-hour, and --update-minute must all be provided."
+        fi
+    fi
 }
 
 show_help() {
@@ -143,6 +210,11 @@ Options:
                     Check if they are installed, fail if not.
   --no-update-vm    Skip system package update (apt-get update/upgrade)
   --tag VERSION     Specify agent image tag (default: latest)
+  --no-auto-update  Do not create the automatic update cron job
+  --update-weekday N
+                    Weekday for automatic updates (0-6)
+  --update-hour N   Hour for automatic updates (0-23)
+  --update-minute N Minute for automatic updates (0-59)
   --help, -h        Show this help message
 
 Environment variables:
@@ -176,6 +248,16 @@ install_package() {
         log_info "$package not found. Installing..."
         apt-get install -y "$package"
     fi
+}
+
+install_cron() {
+    if cron_installed; then
+        log_info "cron already installed."
+        return 0
+    fi
+
+    log_info "cron not found. Installing..."
+    apt-get install -y cron
 }
 
 install_docker() {
@@ -875,6 +957,69 @@ wait_for_health() {
 }
 
 # =============================================================================
+# Update Script and Cron Job
+# =============================================================================
+
+create_update_script() {
+    log_info "Creating update script at $UPDATE_SCRIPT..."
+
+    cat > "$UPDATE_SCRIPT" <<EOF
+#!/usr/bin/env sh
+
+set -eu
+
+cd "$AGENT_DIR"
+docker compose pull
+docker compose up -d
+EOF
+
+    chmod +x "$UPDATE_SCRIPT"
+}
+
+configure_update_cron() {
+    local cron_weekday="$UPDATE_WEEKDAY"
+    local cron_hour="$UPDATE_HOUR"
+    local cron_minute="$UPDATE_MINUTE"
+
+    if [ "$NO_AUTO_UPDATE" = "true" ]; then
+        log_info "Automatic updates disabled. Skipping cron update."
+        return 0
+    fi
+
+    log_info "Configuring weekly update cron job..."
+
+    if [ -f "$CRON_FILE" ] && [ "$UPDATE_WEEKDAY" -eq -1 ]; then
+        log_info "Existing cron file found and update schedule was not provided. Skipping cron update."
+        return 0
+    fi
+
+    # If WeekDay is not set, randomize between Sunday (0) and Saturday (6)
+    if [ "$cron_weekday" -eq -1 ]; then
+        cron_weekday=$(random_int_in_range 0 1)
+        if [ "$cron_weekday" -eq 1 ]; then
+            cron_weekday=6
+        fi
+    fi
+
+    if [ "$cron_hour" -eq -1 ]; then
+        cron_hour=$(random_int_in_range 3 5)
+    fi
+
+    if [ "$cron_minute" -eq -1 ]; then
+        cron_minute=$(random_int_in_range 0 59)
+    fi
+
+    mkdir -p "$AGENT_DIR/logs"
+    systemctl enable cron
+
+    cat > "$CRON_FILE" <<EOF
+$cron_minute $cron_hour * * $cron_weekday root $UPDATE_SCRIPT > $AGENT_DIR/logs/update-\$(date +\%Y\%m\%d-\%H\%M\%S).log 2>&1
+EOF
+
+    chmod 644 "$CRON_FILE"
+}
+
+# =============================================================================
 # Key Retrieval
 # =============================================================================
 
@@ -942,12 +1087,22 @@ main() {
     else
         install_dependencies
     fi
+
+    if [ "$NO_AUTO_UPDATE" = "true" ]; then
+        log_info "Skipping auto-update configuration (NO_AUTO_UPDATE=true)."
+        cron_installed || die "cron not found and --no-auto-update was set. Install cron and retry."
+    else
+        install_cron
+    fi
+
     configure_docker_ipv6
     configure_tls
     setup_directories
     setup_certificates
     detect_compose_mode
     generate_docker_compose
+    create_update_script
+    configure_update_cron
     deploy_containers
     wait_for_health
     retrieve_keys
