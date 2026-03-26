@@ -137,7 +137,7 @@ install_dependencies() {
          log_info "Skipping system update (NO_UPDATE_VM=true)."
      else
      log_info "Updating system packages..."
-     apt-get update -y && apt-get upgrade -y
+     run_apt_get update -y && run_apt_get upgrade -y
      fi
 
      install_package "curl"
@@ -150,7 +150,7 @@ install_package() {
 
     if ! command_exists "$package"; then
         log_info "$package not found. Installing..."
-        apt-get install -y "$package"
+        run_apt_get install -y "$package"
     fi
 }
 
@@ -169,6 +169,14 @@ install_docker() {
     fi
 
     systemctl restart docker
+}
+
+run_apt_get() {
+    # Ensure apt-get runs non-interactively and doesn't prompt for user input
+    DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$@"
 }
 
 # =============================================================================
