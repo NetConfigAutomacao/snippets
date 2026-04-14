@@ -24,14 +24,25 @@ curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/he
 
 ## Pré-requisitos
 
-- Host Debian/Ubuntu (ou derivado) com privilégios de root.
-- Conectividade com a internet para instalação de pacotes e download das imagens Docker.
+- Host Debian/Ubuntu (ou derivado).
+- Pelo menos 4 GB de RAM e 4 vCPUs para evitar contenção com Agent e Traefik.
+- Acesso externo SSH por IPv4 público ou IPv6 com privilégios de root ou sudo.
+- Conectividade com a internet durante e pós instalação para instalação de pacotes, download das imagens Docker e comunicação com o servidor da NetConfig.
+- Pacotes esperados no host: `Docker`, `curl`, `openssl` e `cron` quando o auto update estiver habilitado.
+- Pacote opcional: `jq`, usado para merge mais seguro de configuracao Docker quando necessario.
 - Portas liberadas:
-  - `8080/tcp` (HTTP do agente via Traefik)
-  - `8443/tcp` (HTTPS do agente via Traefik)
   - `2222/tcp` (túnel SSH do agente)
-  - `80/tcp` (utilizada pelo desafio ACME ao usar Let's Encrypt)
+  - `8443/tcp` (HTTPS do agente via Traefik)
+  - `8080/tcp` (Opcional: HTTP do agente via Traefik caso não seja possível HTTPS)
+  - `80/tcp` (Opcional: utilizada pelo desafio ACME ao usar Let's Encrypt)
 - DNS apontando para o host caso vá utilizar Let's Encrypt.
+
+## Aviso para VM compartilhada
+
+Se o host já executa outros serviços ou containers:
+
+- revise cuidadosamente as opções avançadas antes do reinstall;
+- confirme portas livres e impacto de instalar Docker/dependências.
 
 ## Flags disponíveis
 
@@ -41,9 +52,9 @@ O script aceita as seguintes flags de linha de comando:
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--unattended`, `--no-prompt`, `--no-ask`, `-y` | Executa sem prompts interativos. Usa valores padrão (HTTPS com certificado autoassinado).                                                                                               |
 | `--no-install-vm-docker`                        | **Não instala** Docker, curl ou openssl. Apenas verifica se estão instalados. Se algum estiver faltando, o script para com erro. Útil quando você gerencia as dependências manualmente. |
-| `--no-update-vm`                                | Pula `apt-get update && apt-get upgrade`. Ainda instala dependências se necessário (a menos que `--no-install-vm-docker` também esteja ativa).                                          |
+| `--no-update-vm`                                | Pula a atualização seletiva dos pacotes exigidos pelo instalador. Ainda instala dependências se necessário (a menos que `--no-install-vm-docker` também esteja ativa).                    |
 | `--tag VERSION`                                 | Especifica a tag da imagem do agente (padrão: `latest`). Exemplo: `--tag v1.23.1`                                                                                                       |
-| `--no-auto-update`                              | Não cria o agendamento automático de atualização em `/etc/cron.d/netconfig`.                                                                                                            |
+| `--no-auto-update`                              | Não cria o agendamento automático de atualização em `/etc/cron.d/netconfig-agent`.                                                                                                            |
 | `--update-weekday N`                            | Define o dia da semana do update automático (`0-6`). Deve ser usado junto com `--update-hour` e `--update-minute`.                                                                      |
 | `--update-hour N`                               | Define a hora do update automático (`0-23`). Deve ser usado junto com `--update-weekday` e `--update-minute`.                                                                           |
 | `--update-minute N`                             | Define o minuto do update automático (`0-59`). Deve ser usado junto com `--update-weekday` e `--update-hour`.                                                                           |
@@ -128,7 +139,7 @@ sudo DISABLE_TLS=true agent/install.sh
 
 O instalador:
 
-- Atualiza os pacotes do sistema e instala `curl`, `openssl` e Docker, se necessário.
+- Atualiza seletivamente os pacotes exigidos pelo instalador e instala `curl`, `openssl` e `Docker`, se necessário.
 - Sobe o stack Docker com Traefik escutando apenas em `:8080`.
 - Publica o NetConfig Agent em `http://<host>:8080` e mantém o túnel `2222/tcp`.
 
@@ -207,7 +218,7 @@ O instalador:
   sudo docker compose up -d
   ```
 
-Por padrão, o instalador cria `/etc/cron.d/netconfig` para executar o `update.sh` semanalmente. Se o arquivo já existir e nenhum `--update-*` for informado, ele é preservado. Use `--no-auto-update` para não criar esse cron.
+Por padrão, o instalador cria `/etc/cron.d/netconfig-agent` para executar o `update.sh` semanalmente. Se o arquivo já existir e nenhum `--update-*` for informado, ele é preservado. Use `--no-auto-update` para não criar esse cron.
 
 ## Estrutura gerada
 
@@ -229,6 +240,7 @@ Por padrão, o instalador cria `/etc/cron.d/netconfig` para executar o `update.s
 - **Aviso de certificado inválido**: importe `/opt/netconfig-agent/traefik/certs/selfsigned.crt` no trust store (modo autoassinado).
 - **Porta em uso**: finalize serviços que utilizem 80, 8080, 8443 ou 2222 antes de reexecutar o instalador.
 - **Docker não está instalado (com --no-install-vm-docker)**: remova a flag `--no-install-vm-docker` ou instale o Docker manualmente antes de executar o script.
+- **Host com outras aplicações**: revise as opções avançadas antes de repetir o reinstall automático.
 
 ## Suporte
 

@@ -6,11 +6,13 @@ set -eu
 # NetConfig Radius Installer
 # =============================================================================
 
-readonly SCRIPT_VERSION="1.2.0"
 readonly TRAEFIK_VERSION="v3.6.1"
 readonly RADIUS_DIR="/opt/netconfig-radius"
 readonly TRAEFIK_DIR="${RADIUS_DIR}/traefik"
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
+readonly UPDATE_SCRIPT="${RADIUS_DIR}/update.sh"
+readonly UPDATE_LOCK_DIR="${RADIUS_DIR}/.update.lock"
+readonly CRON_FILE="/etc/cron.d/netconfig-radius"
 readonly MAX_WAIT=300
 readonly WAIT_INTERVAL=5
 
@@ -21,9 +23,13 @@ readonly WAIT_INTERVAL=5
 UNATTENDED=false
 NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
+NO_AUTO_UPDATE=false
 REINSTALL=false
 COMPOSE_MODE=""
 RADIUS_TAG="latest"
+UPDATE_WEEKDAY="-1"
+UPDATE_HOUR="-1"
+UPDATE_MINUTE="-1"
 
 # =============================================================================
 # Logging Functions
@@ -54,14 +60,139 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+cron_installed() {
+    dpkg -s cron >/dev/null 2>&1
+}
+
+random_int_in_range() {
+    local min="$1"
+    local max="$2"
+    local span
+    local random_value
+
+    span=$((max - min + 1))
+    random_value=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+
+    printf '%s\n' $((min + (random_value % span)))
+}
+
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         die "This installer must run as root (tip: use sudo)."
     fi
 }
 
+socket_listener_exists() {
+    local protocol="$1"
+    local port="$2"
+
+    case "$protocol" in
+        tcp)
+            ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q .
+            ;;
+        udp)
+            ss -lunH "( sport = :$port )" 2>/dev/null | grep -q .
+            ;;
+        *)
+            die "Unsupported protocol for port validation: $protocol"
+            ;;
+    esac
+}
+
+is_managed_container_name() {
+    case "$1" in
+        netconfig_radius_api|netconfig_radius_server|netconfig_radius_db|netconfig_radius_traefik) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+docker_container_uses_host_port() {
+    local container_name="$1"
+    local port="$2"
+    local protocol="$3"
+
+    docker port "$container_name" 2>/dev/null | grep -Eq "^${port}/${protocol}[[:space:]]*->[[:space:]].*:${port}$"
+}
+
+port_used_by_managed_docker_container() {
+    local port="$1"
+    local protocol="$2"
+    local container_name
+
+    if ! command_exists docker; then
+        return 1
+    fi
+
+    for container_name in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if is_managed_container_name "$container_name" && docker_container_uses_host_port "$container_name" "$port" "$protocol"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+port_used_by_unmanaged_docker_container() {
+    local port="$1"
+    local protocol="$2"
+    local container_name
+
+    if ! command_exists docker; then
+        return 1
+    fi
+
+    for container_name in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if ! is_managed_container_name "$container_name" && docker_container_uses_host_port "$container_name" "$port" "$protocol"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+assert_port_available() {
+    local port="$1"
+    local protocol="$2"
+
+    if port_used_by_unmanaged_docker_container "$port" "$protocol"; then
+        die "Port ${port}/${protocol} is already in use by another Docker container. Stop the conflicting service before retrying."
+    fi
+
+    if socket_listener_exists "$protocol" "$port" && ! port_used_by_managed_docker_container "$port" "$protocol"; then
+        die "Port ${port}/${protocol} is already in use on this host. Stop the conflicting service before retrying."
+    fi
+}
+
+validate_required_ports() {
+    assert_port_available 9443 tcp
+    assert_port_available 1812 udp
+    assert_port_available 1813 udp
+
+    log_info "Port validation completed."
+}
+
 generate_password() {
     openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32
+}
+
+is_integer() {
+    case "$1" in
+        -|''|*[!0-9-]*|*--*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_integer_range() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+    local option_name="$4"
+
+    is_integer "$value" || die "$option_name must be an integer."
+
+    if [ "$value" -ne -1 ] && { [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; }; then
+        die "Option $option_name must be between $min and $max."
+    fi
 }
 
 # =============================================================================
@@ -87,11 +218,30 @@ parse_arguments() {
                 NO_UPDATE_VM=true
                 shift
                 ;;
+            --no-auto-update)
+                NO_AUTO_UPDATE=true
+                shift
+                ;;
             --tag)
                 if [ -z "${2:-}" ]; then
                     die "Option --tag requires a value (e.g., --tag v1.0.0)"
                 fi
                 RADIUS_TAG="$2"
+                shift 2
+                ;;
+            --update-weekday)
+                validate_integer_range "$2" 0 6 "--update-weekday"
+                UPDATE_WEEKDAY="$2"
+                shift 2
+                ;;
+            --update-hour)
+                validate_integer_range "$2" 0 23 "--update-hour"
+                UPDATE_HOUR="$2"
+                shift 2
+                ;;
+            --update-minute)
+                validate_integer_range "$2" 0 59 "--update-minute"
+                UPDATE_MINUTE="$2"
                 shift 2
                 ;;
             --help|-h)
@@ -103,6 +253,12 @@ parse_arguments() {
                 ;;
         esac
     done
+
+    if [ "$UPDATE_WEEKDAY" -ne -1 ] || [ "$UPDATE_HOUR" -ne -1 ] || [ "$UPDATE_MINUTE" -ne -1 ]; then
+        if [ "$UPDATE_WEEKDAY" -eq -1 ] || [ "$UPDATE_HOUR" -eq -1 ] || [ "$UPDATE_MINUTE" -eq -1 ]; then
+            die "If one update schedule option is provided, --update-weekday, --update-hour, and --update-minute must all be provided."
+        fi
+    fi
 }
 
 show_help() {
@@ -112,7 +268,7 @@ Usage: install.sh [OPTIONS]
 Options:
   --unattended, --no-prompt, --no-ask, -y
                     Run installation without interactive prompts
-  --reinstall        Wipe existing NetConfig Radius installation (containers,
+  --reinstall       Wipe existing NetConfig Radius installation (containers,
                     volume data, and files under /opt/netconfig-radius) and
                     run the installation again (DESTRUCTIVE)
   --no-install-vm-docker
@@ -121,6 +277,11 @@ Options:
   --no-update-vm    Skip system package update (apt-get update/upgrade)
   --tag VERSION     Specify image tag for radius-db, radius-api,
                     and radius-server (default: latest)
+  --no-auto-update  Do not create the automatic update cron job
+  --update-weekday N
+                    Weekday for automatic updates (0-6)
+  --update-hour N   Hour for automatic updates (0-23)
+  --update-minute N Minute for automatic updates (0-59)
   --help, -h        Show this help message
 
 Environment variables:
@@ -136,22 +297,30 @@ install_dependencies() {
      if [ "$NO_UPDATE_VM" = "true" ]; then
          log_info "Skipping system update (NO_UPDATE_VM=true)."
      else
-     log_info "Updating system packages..."
-     run_apt_get update -y && run_apt_get upgrade -y
+     log_info "Refreshing package index for required dependencies..."
+     run_apt_get update -y
      fi
 
-     install_package "curl"
-     install_package "openssl"
+     ensure_package "curl"
+     ensure_package "openssl"
      install_docker
 }
 
-install_package() {
+package_installed() {
+    dpkg -s "$1" >/dev/null 2>&1
+}
+
+ensure_package() {
     local package="$1"
 
-    if ! command_exists "$package"; then
+    if ! package_installed "$package"; then
         log_info "$package not found. Installing..."
         run_apt_get install -y "$package"
+        return 0
     fi
+
+    log_info "Updating required package: $package"
+    run_apt_get install -y --only-upgrade "$package"
 }
 
 install_docker() {
@@ -169,6 +338,17 @@ install_docker() {
     fi
 
     systemctl restart docker
+}
+
+install_cron() {
+    if cron_installed; then
+        log_info "Updating required package: cron"
+        run_apt_get install -y --only-upgrade cron
+        return 0
+    fi
+
+    log_info "cron not found. Installing..."
+    run_apt_get install -y cron
 }
 
 run_apt_get() {
@@ -516,7 +696,7 @@ compose_api_service() {
       RADIUS_ITEMS_PER_PAGE: 100
       RADIUS_SERVER_CONTAINER: netconfig_radius_server
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - radius-internal
 EOF
@@ -584,6 +764,110 @@ wait_for_health() {
 }
 
 # =============================================================================
+# Update Script and Cron Job
+# =============================================================================
+
+create_update_script() {
+    log_info "Creating update script at $UPDATE_SCRIPT..."
+
+    cat > "$UPDATE_SCRIPT" <<EOF
+#!/usr/bin/env sh
+
+set -eu
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+detect_update_compose_mode() {
+    if command -v docker-compose >/dev/null 2>&1; then
+        printf '%s\n' "docker-compose"
+        return 0
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        printf '%s\n' "docker compose"
+        return 0
+    fi
+
+    printf '%s\n' "ERROR_COMPOSE_NOT_FOUND" >&2
+    return 1
+}
+
+cleanup() {
+    rmdir "$UPDATE_LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+if ! mkdir "$UPDATE_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "Another NetConfig Radius update is already running." >&2
+    exit 0
+fi
+
+trap cleanup EXIT INT TERM
+
+if [ ! -d "$RADIUS_DIR" ]; then
+    printf '%s\n' "Radius directory not found: $RADIUS_DIR" >&2
+    exit 1
+fi
+
+cd "$RADIUS_DIR"
+
+if [ ! -f docker-compose.yml ]; then
+    printf '%s\n' "docker-compose.yml not found in $RADIUS_DIR" >&2
+    exit 1
+fi
+
+COMPOSE_MODE="\$(detect_update_compose_mode)"
+
+\$COMPOSE_MODE pull
+\$COMPOSE_MODE up -d
+EOF
+
+    chmod +x "$UPDATE_SCRIPT"
+}
+
+configure_update_cron() {
+    local cron_weekday="$UPDATE_WEEKDAY"
+    local cron_hour="$UPDATE_HOUR"
+    local cron_minute="$UPDATE_MINUTE"
+
+    if [ "$NO_AUTO_UPDATE" = "true" ]; then
+        log_info "Automatic updates disabled. Skipping cron update."
+        return 0
+    fi
+
+    log_info "Configuring weekly update cron job..."
+
+    if [ -f "$CRON_FILE" ] && [ "$UPDATE_WEEKDAY" -eq -1 ]; then
+        log_info "Existing cron file found and update schedule was not provided. Skipping cron update."
+        return 0
+    fi
+
+    if [ "$cron_weekday" -eq -1 ]; then
+        cron_weekday=$(random_int_in_range 0 1)
+        if [ "$cron_weekday" -eq 1 ]; then
+            cron_weekday=6
+        fi
+    fi
+
+    if [ "$cron_hour" -eq -1 ]; then
+        cron_hour=$(random_int_in_range 3 5)
+    fi
+
+    if [ "$cron_minute" -eq -1 ]; then
+        cron_minute=$(random_int_in_range 0 59)
+    fi
+
+    mkdir -p "$RADIUS_DIR/logs"
+    systemctl enable cron
+
+    cat > "$CRON_FILE" <<EOF
+$cron_minute $cron_hour * * $cron_weekday root $UPDATE_SCRIPT > $RADIUS_DIR/logs/update-\$(date +\%Y\%m\%d-\%H\%M\%S).log 2>&1
+EOF
+
+    chmod 644 "$CRON_FILE"
+    log_info "Automatic update scheduled for weekday=${cron_weekday} hour=${cron_hour} minute=${cron_minute}."
+}
+
+# =============================================================================
 # Display Credentials
 # =============================================================================
 
@@ -628,10 +912,6 @@ main() {
     check_root
     check_distro
 
-    if [ "$REINSTALL" = "true" ]; then
-        wipe_previous_installation
-    fi
-
     if [ "$NO_INSTALL_VM_DOCKER" = "true" ]; then
         log_info "Skipping Docker/dependency installation (NO_INSTALL_VM_DOCKER=true)."
         command_exists curl || die "curl not found and --no-install-vm-docker was set. Install curl and retry."
@@ -640,12 +920,27 @@ main() {
     else
         install_dependencies
     fi
+
+    if [ "$NO_AUTO_UPDATE" = "true" ]; then
+        log_info "Skipping auto-update configuration (NO_AUTO_UPDATE=true)."
+        cron_installed || die "cron not found and --no-auto-update was set. Install cron and retry."
+    else
+        install_cron
+    fi
+
+    validate_required_ports
+
+    if [ "$REINSTALL" = "true" ]; then
+        wipe_previous_installation
+    fi
     setup_directories
     setup_certificates
     setup_credentials
     write_env_file
     detect_compose_mode
     generate_docker_compose
+    create_update_script
+    configure_update_cron
     deploy_containers
     wait_for_health
     display_credentials

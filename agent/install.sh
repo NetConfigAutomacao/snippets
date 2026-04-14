@@ -6,13 +6,13 @@ set -eu
 # NetConfig Agent Installer
 # =============================================================================
 
-readonly SCRIPT_VERSION="1.0.0"
 readonly TRAEFIK_VERSION="v3.6.1"
 readonly AGENT_DIR="/opt/netconfig-agent"
 readonly TRAEFIK_DIR="${AGENT_DIR}/traefik"
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 readonly UPDATE_SCRIPT="${AGENT_DIR}/update.sh"
-readonly CRON_FILE="/etc/cron.d/netconfig"
+readonly UPDATE_LOCK_DIR="${AGENT_DIR}/.update.lock"
+readonly CRON_FILE="/etc/cron.d/netconfig-agent"
 readonly MAX_WAIT=300
 readonly WAIT_INTERVAL=5
 
@@ -86,6 +86,101 @@ random_int_in_range() {
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         die "This installer must run as root (tip: use sudo)."
+    fi
+}
+
+socket_listener_exists() {
+    local protocol="$1"
+    local port="$2"
+
+    case "$protocol" in
+        tcp)
+            ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q .
+            ;;
+        udp)
+            ss -lunH "( sport = :$port )" 2>/dev/null | grep -q .
+            ;;
+        *)
+            die "Unsupported protocol for port validation: $protocol"
+            ;;
+    esac
+}
+
+is_managed_container_name() {
+    case "$1" in
+        netconfig_agent|netconfig_traefik) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+docker_container_uses_host_port() {
+    local container_name="$1"
+    local port="$2"
+    local protocol="$3"
+
+    docker port "$container_name" 2>/dev/null | awk -v target_port="$port" -v target_protocol="$protocol" '
+        $1 ~ "/" target_protocol "$" {
+            published_port = $3
+            sub(/^.*:/, "", published_port)
+
+            if (published_port == target_port) {
+                found = 1
+                exit 0
+            }
+        }
+
+        END {
+            exit(found ? 0 : 1)
+        }
+    '
+}
+
+port_used_by_managed_docker_container() {
+    local port="$1"
+    local protocol="$2"
+    local container_name
+
+    if ! command_exists docker; then
+        return 1
+    fi
+
+    for container_name in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if is_managed_container_name "$container_name" && docker_container_uses_host_port "$container_name" "$port" "$protocol"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+port_used_by_unmanaged_docker_container() {
+    local port="$1"
+    local protocol="$2"
+    local container_name
+
+    if ! command_exists docker; then
+        return 1
+    fi
+
+    for container_name in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if ! is_managed_container_name "$container_name" && docker_container_uses_host_port "$container_name" "$port" "$protocol"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+assert_port_available() {
+    local port="$1"
+    local protocol="$2"
+
+    if port_used_by_unmanaged_docker_container "$port" "$protocol"; then
+        die "Port ${port}/${protocol} is already in use by another Docker container. Stop the conflicting service or review the advanced options before retrying."
+    fi
+
+    if socket_listener_exists "$protocol" "$port" && ! port_used_by_managed_docker_container "$port" "$protocol"; then
+        die "Port ${port}/${protocol} is already in use on this host. Stop the conflicting service or review the advanced options before retrying."
     fi
 }
 
@@ -202,7 +297,7 @@ Usage: install.sh [OPTIONS]
 Options:
   --unattended, --no-prompt, --no-ask, -y
                     Run installation without interactive prompts
-  --reinstall        Wipe existing NetConfig Agent installation (containers,
+  --reinstall       Wipe existing NetConfig Agent installation (containers,
                     volume data, and files under /opt/netconfig-agent) and
                     run the installation again (DESTRUCTIVE)
   --no-install-vm-docker
@@ -232,27 +327,36 @@ install_dependencies() {
      if [ "$NO_UPDATE_VM" = "true" ]; then
          log_info "Skipping system update (NO_UPDATE_VM=true)."
      else
-     log_info "Updating system packages..."
-     run_apt_get update -y && run_apt_get upgrade -y
+     log_info "Refreshing package index for required dependencies..."
+     run_apt_get update -y
      fi
 
-     install_package "curl"
-     install_package "openssl"
+     ensure_package "curl"
+     ensure_package "openssl"
      install_docker
 }
 
-install_package() {
+package_installed() {
+    dpkg -s "$1" >/dev/null 2>&1
+}
+
+ensure_package() {
     local package="$1"
 
-    if ! command_exists "$package"; then
+    if ! package_installed "$package"; then
         log_info "$package not found. Installing..."
         run_apt_get install -y "$package"
+        return 0
     fi
+
+    log_info "Updating required package: $package"
+    run_apt_get install -y --only-upgrade "$package"
 }
 
 install_cron() {
     if cron_installed; then
-        log_info "cron already installed."
+        log_info "Updating required package: cron"
+        run_apt_get install -y --only-upgrade cron
         return 0
     fi
 
@@ -286,8 +390,33 @@ run_apt_get() {
 }
 
 # =============================================================================
-# Docker Configuration
+# Docker Validation and Configuration
 # =============================================================================
+
+docker_ipv6_enabled() {
+    local probe_network_name="netconfig_ipv6_probe_$(date +%s)"
+    local probe_subnet_suffix
+    local probe_subnet
+
+    probe_subnet_suffix=$(printf '%x' "$(random_int_in_range 1 65535)")
+    probe_subnet="fd12:3456:789a:${probe_subnet_suffix}::/64"
+
+    if ! docker network create --ipv6 --subnet "$probe_subnet" "$probe_network_name" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! docker network inspect --format '{{.EnableIPv6}}' "$probe_network_name" 2>/dev/null | grep -qx 'true'; then
+        docker network rm "$probe_network_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    docker network rm "$probe_network_name" >/dev/null 2>&1 || true
+    return 0
+}
+
+docker_has_unmanaged_containers() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eqv '^(netconfig_agent|netconfig_traefik)$'
+}
 
 configure_docker_ipv6() {
     if [ -f "$DOCKER_CONFIG_FILE" ]; then
@@ -299,7 +428,8 @@ configure_docker_ipv6() {
 
 configure_existing_docker_ipv6() {
     if grep -q '"ipv6"[[:space:]]*:[[:space:]]*true' "$DOCKER_CONFIG_FILE" 2>/dev/null; then
-        log_info "Docker IPv6 support already enabled."
+        log_info "Docker IPv6 support already enabled in daemon.json."
+        systemctl restart docker
         return 0
     fi
 
@@ -346,6 +476,36 @@ create_docker_ipv6_config() {
 EOF
 
     systemctl restart docker
+}
+
+ensure_docker_ipv6_support() {
+    if docker_ipv6_enabled; then
+        log_info "Docker IPv6 support already enabled."
+        return 0
+    fi
+
+    if docker_has_unmanaged_containers; then
+        die "Docker IPv6 support is required for NetConfig Agent, but this host already has containers not managed by this installer. Configure ${DOCKER_CONFIG_FILE} manually with \\\"ipv6\\\": true and restart Docker before retrying."
+    fi
+
+    log_info "No unmanaged Docker containers found. Applying Docker IPv6 configuration automatically."
+    configure_docker_ipv6
+}
+
+validate_required_ports() {
+    assert_port_available 2222 tcp
+
+    if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
+        assert_port_available 8443 tcp
+    else
+        assert_port_available 8080 tcp
+    fi
+
+    if [ "$USE_ACME" = "true" ]; then
+        assert_port_available 80 tcp
+    fi
+
+    log_info "Port validation completed."
 }
 
 # =============================================================================
@@ -729,6 +889,7 @@ services:
       - "--providers.docker.network=netconfig"
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.web.address=:8080"
+      - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
       - "8080:8080"
     volumes:
@@ -752,6 +913,7 @@ services:
     networks:
       - local
     labels:
+      - "agent.stack=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -793,6 +955,7 @@ services:
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.web.address=:8080"
       - "--entryPoints.websecure.address=:8443"
+      - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
       - "8080:8080"
       - "8443:8443"
@@ -818,6 +981,7 @@ services:
     networks:
       - local
     labels:
+      - "agent.stack=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -870,6 +1034,7 @@ services:
       - "--certificatesresolvers.le.acme.email=__ACME_EMAIL__"
       - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=acme"
+      - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
       - "80:80"
       - "8080:8080"
@@ -896,6 +1061,7 @@ services:
     networks:
       - local
     labels:
+      - "agent.stack=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -976,9 +1142,50 @@ create_update_script() {
 
 set -eu
 
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+detect_update_compose_mode() {
+    if command -v docker-compose >/dev/null 2>&1; then
+        printf '%s\n' "docker-compose"
+        return 0
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        printf '%s\n' "docker compose"
+        return 0
+    fi
+
+    printf '%s\n' "ERROR_COMPOSE_NOT_FOUND" >&2
+    return 1
+}
+
+cleanup() {
+    rmdir "$UPDATE_LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+if ! mkdir "$UPDATE_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "Another NetConfig Agent update is already running." >&2
+    exit 0
+fi
+
+trap cleanup EXIT INT TERM
+
+if [ ! -d "$AGENT_DIR" ]; then
+    printf '%s\n' "Agent directory not found: $AGENT_DIR" >&2
+    exit 1
+fi
+
 cd "$AGENT_DIR"
-docker compose pull
-docker compose up -d
+
+if [ ! -f docker-compose.yml ]; then
+    printf '%s\n' "docker-compose.yml not found in $AGENT_DIR" >&2
+    exit 1
+fi
+
+COMPOSE_MODE="\$(detect_update_compose_mode)"
+
+\$COMPOSE_MODE pull
+\$COMPOSE_MODE up -d
 EOF
 
     chmod +x "$UPDATE_SCRIPT"
@@ -995,6 +1202,11 @@ configure_update_cron() {
     fi
 
     log_info "Configuring weekly update cron job..."
+
+    # Rename old file if it exists for backward compatibility
+    if [ -f "/etc/cron.d/netconfig" ]; then
+        mv "/etc/cron.d/netconfig" "$CRON_FILE"
+    fi
 
     if [ -f "$CRON_FILE" ] && [ "$UPDATE_WEEKDAY" -eq -1 ]; then
         log_info "Existing cron file found and update schedule was not provided. Skipping cron update."
@@ -1025,6 +1237,7 @@ $cron_minute $cron_hour * * $cron_weekday root $UPDATE_SCRIPT > $AGENT_DIR/logs/
 EOF
 
     chmod 644 "$CRON_FILE"
+    log_info "Automatic update scheduled for weekday=${cron_weekday} hour=${cron_hour} minute=${cron_minute}."
 }
 
 # =============================================================================
@@ -1083,10 +1296,6 @@ main() {
     check_root
     check_distro
 
-    if [ "$REINSTALL" = "true" ]; then
-        wipe_previous_installation
-    fi
-
     if [ "$NO_INSTALL_VM_DOCKER" = "true" ]; then
         log_info "Skipping Docker/dependency installation (NO_INSTALL_VM_DOCKER=true)."
         command_exists curl || die "curl not found and --no-install-vm-docker was set. Install curl and retry."
@@ -1103,8 +1312,14 @@ main() {
         install_cron
     fi
 
-    configure_docker_ipv6
     configure_tls
+    validate_required_ports
+    ensure_docker_ipv6_support
+
+    if [ "$REINSTALL" = "true" ]; then
+        wipe_previous_installation
+    fi
+
     setup_directories
     setup_certificates
     detect_compose_mode
