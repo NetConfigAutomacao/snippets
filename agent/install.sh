@@ -6,15 +6,85 @@ set -eu
 # NetConfig Agent Installer
 # =============================================================================
 
-readonly TRAEFIK_VERSION="v3.6.1"
-readonly AGENT_DIR="/opt/netconfig-agent"
-readonly TRAEFIK_DIR="${AGENT_DIR}/traefik"
+# -----------------------------------------------------------------------------
+# Overridable settings
+#
+# Every value below can be replaced from the environment before running the
+# installer, so an advanced operator never has to edit this script:
+#
+#   AGENT_DIR=/srv/netconfig-agent SSH_TUNNEL_PORT=2322 ./install.sh
+#
+# Defaults are what a normal installation gets; validate_settings() rejects a
+# malformed value up front rather than letting docker fail halfway through.
+# -----------------------------------------------------------------------------
+
+# Where the stack lives on disk, and the images it runs.
+AGENT_DIR="${AGENT_DIR:-/opt/netconfig-agent}"
+AGENT_IMAGE="${AGENT_IMAGE:-netconfigsup/agent}"
+TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik}"
+TRAEFIK_VERSION="${TRAEFIK_VERSION:-v3.6.1}"
+
+# Host ports. The container-side ports are fixed; these are the ones published
+# on the host, which is what collides with something else already running.
+SSH_TUNNEL_PORT="${SSH_TUNNEL_PORT:-2222}"
+HTTP_PORT="${HTTP_PORT:-8080}"
+HTTPS_PORT="${HTTPS_PORT:-8443}"
+ACME_HTTP_PORT="${ACME_HTTP_PORT:-80}"
+
+# Which host address the ports are published on. Empty means every interface,
+# Docker's own default. Set it on a multi-homed host to keep the agent off the
+# interfaces that should not answer.
+BIND_ADDRESS="${BIND_ADDRESS:-}"
+
+# The agent container reaches customer equipment from inside this network, so
+# any address the customer uses that falls inside it is on-link here and its
+# traffic never leaves the machine — the device then looks dead while nothing
+# is wrong with it. Override both when the range is already taken on site.
+#
+# Docker's default pool (172.17.0.0/16 … 172.31.0.0/16) collides with customer
+# addressing constantly, which is why the range is pinned instead of drawn.
+# 198.19.166.0/24 sits inside 198.18.0.0/15, reserved by RFC 2544 for network
+# benchmarking: IANA never assigns it, it must not appear in the global routing
+# table, and nobody numbers a LAN there. The 166 is deliberate — vendors that
+# do use 198.18/15 internally (Cisco Umbrella, SD-WAN appliances) sit at the
+# bottom of the range.
+#
+# The IPv6 side mirrors it inside 2001:db8::/32, the RFC 3849 documentation
+# prefix, reserved on the same terms. It stops at the fourth group because a
+# /64 has no room for a fifth — Docker rejects 2001:db8:198:19:166::/64 with
+# "it should be 2001:db8:198:19::/64".
+#
+# Pinned rather than left to Docker: recent versions auto-assign a ULA to an
+# enable_ipv6 network, older ones refuse it without an explicit subnet.
+AGENT_NETWORK_SUBNET="${AGENT_NETWORK_SUBNET:-198.19.166.0/24}"
+AGENT_NETWORK_SUBNET_V6="${AGENT_NETWORK_SUBNET_V6:-2001:db8:198:166::/64}"
+
+# DOCKER0_CIDR_V6 numbers the default bridge, which this stack never attaches
+# to — agent and traefik live on the network above. It exists only because
+# "ipv6": true needs a companion prefix to switch IPv6 on at all, so its value
+# is left at Docker's own documentation-prefix default. It must not equal the
+# network's /64 above: Docker refuses the second of two identical pools
+# ("Pool overlaps with other one on this address space").
+DOCKER0_CIDR_V6="${DOCKER0_CIDR_V6:-2001:db8:1::/64}"
+
+# Set to true on a host whose Docker daemon is managed elsewhere (Ansible,
+# Puppet, a golden image): the installer then never writes daemon.json and
+# never restarts Docker, and expects IPv6 to be enabled already.
+SKIP_DOCKER_DAEMON_CONFIG="${SKIP_DOCKER_DAEMON_CONFIG:-false}"
+
+# Container log rotation, passed straight to the json-file driver.
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-10m}"
+LOG_MAX_FILE="${LOG_MAX_FILE:-5}"
+
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
-readonly UPDATE_SCRIPT="${AGENT_DIR}/update.sh"
-readonly UPDATE_LOCK_DIR="${AGENT_DIR}/.update.lock"
 readonly CRON_FILE="/etc/cron.d/netconfig-agent"
 readonly MAX_WAIT=300
 readonly WAIT_INTERVAL=5
+
+# Derived from AGENT_DIR, so an override moves the whole tree.
+TRAEFIK_DIR="${AGENT_DIR}/traefik"
+UPDATE_SCRIPT="${AGENT_DIR}/update.sh"
+UPDATE_LOCK_DIR="${AGENT_DIR}/.update.lock"
 
 # =============================================================================
 # Global State Variables (intentionally global)
@@ -25,12 +95,13 @@ NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
 NO_AUTO_UPDATE=false
 REINSTALL=false
+CHECK_ONLY=false
 DOMAIN=""
 ACME_EMAIL=""
 TRAEFIK_ENABLE_TLS=false
 USE_ACME=false
 COMPOSE_MODE=""
-AGENT_TAG="latest"
+AGENT_TAG="${AGENT_TAG:-latest}"
 UPDATE_WEEKDAY="-1"
 UPDATE_HOUR="-1"
 UPDATE_MINUTE="-1"
@@ -239,6 +310,10 @@ parse_arguments() {
                 REINSTALL=true
                 shift
                 ;;
+            --check)
+                CHECK_ONLY=true
+                shift
+                ;;
             --no-install-vm-docker)
                 NO_INSTALL_VM_DOCKER=true
                 shift
@@ -310,6 +385,9 @@ Options:
                     Weekday for automatic updates (0-6)
   --update-hour N   Hour for automatic updates (0-23)
   --update-minute N Minute for automatic updates (0-59)
+  --check           Inspect the installation and report what is missing,
+                    changing nothing. Exit code 0 when it is current, 1 when
+                    something needs a reinstall.
   --help, -h        Show this help message
 
 Environment variables:
@@ -448,7 +526,7 @@ configure_existing_docker_ipv6() {
 enable_ipv6_with_jq() {
     local temp_config
     temp_config=$(mktemp)
-    jq '. + {"ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64"}' "$DOCKER_CONFIG_FILE" > "$temp_config"
+    jq --arg v6 "$DOCKER0_CIDR_V6" '. + {"ipv6": true, "fixed-cidr-v6": $v6}' "$DOCKER_CONFIG_FILE" > "$temp_config"
     mv "$temp_config" "$DOCKER_CONFIG_FILE"
 }
 
@@ -457,10 +535,10 @@ enable_ipv6_without_jq() {
     cp "$DOCKER_CONFIG_FILE" "$backup_file"
     log_info "Original config backed up to: $backup_file"
 
-    cat > "$DOCKER_CONFIG_FILE" <<'EOF'
+    cat > "$DOCKER_CONFIG_FILE" <<EOF
 {
   "ipv6": true,
-  "fixed-cidr-v6": "2001:db8:1::/64"
+  "fixed-cidr-v6": "${DOCKER0_CIDR_V6}"
 }
 EOF
 }
@@ -468,10 +546,10 @@ EOF
 create_docker_ipv6_config() {
     log_info "Enabling IPv6 support for Docker..."
 
-    cat > "$DOCKER_CONFIG_FILE" <<'EOF'
+    cat > "$DOCKER_CONFIG_FILE" <<EOF
 {
   "ipv6": true,
-  "fixed-cidr-v6": "2001:db8:1::/64"
+  "fixed-cidr-v6": "${DOCKER0_CIDR_V6}"
 }
 EOF
 
@@ -488,24 +566,102 @@ ensure_docker_ipv6_support() {
         die "Docker IPv6 support is required for NetConfig Agent, but this host already has containers not managed by this installer. Configure ${DOCKER_CONFIG_FILE} manually with \\\"ipv6\\\": true and restart Docker before retrying."
     fi
 
+    if [ "$SKIP_DOCKER_DAEMON_CONFIG" = "true" ]; then
+        die "Docker IPv6 support is required for NetConfig Agent, but SKIP_DOCKER_DAEMON_CONFIG=true forbids touching ${DOCKER_CONFIG_FILE}. Enable IPv6 in the daemon yourself and retry."
+    fi
+
     log_info "No unmanaged Docker containers found. Applying Docker IPv6 configuration automatically."
     configure_docker_ipv6
 }
 
 validate_required_ports() {
-    assert_port_available 2222 tcp
+    assert_port_available "$SSH_TUNNEL_PORT" tcp
 
     if [ "$TRAEFIK_ENABLE_TLS" = "true" ]; then
-        assert_port_available 8443 tcp
+        assert_port_available "$HTTPS_PORT" tcp
     else
-        assert_port_available 8080 tcp
+        assert_port_available "$HTTP_PORT" tcp
     fi
 
     if [ "$USE_ACME" = "true" ]; then
-        assert_port_available 80 tcp
+        assert_port_available "$ACME_HTTP_PORT" tcp
     fi
 
     log_info "Port validation completed."
+}
+
+# validate_settings rejects an overridden value before anything is installed.
+# A malformed subnet or port otherwise surfaces halfway through, as a docker
+# error about a file this script generated — which is nobody's idea of a clue.
+validate_port_setting() {
+    name="$1"
+    value="$2"
+
+    case "$value" in
+        ''|*[!0-9]*) die "$name must be a number between 1 and 65535, got \"$value\"" ;;
+    esac
+    if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+        die "$name must be between 1 and 65535, got \"$value\""
+    fi
+}
+
+validate_settings() {
+    validate_port_setting SSH_TUNNEL_PORT "$SSH_TUNNEL_PORT"
+    validate_port_setting HTTP_PORT "$HTTP_PORT"
+    validate_port_setting HTTPS_PORT "$HTTPS_PORT"
+    validate_port_setting ACME_HTTP_PORT "$ACME_HTTP_PORT"
+
+    case "$AGENT_NETWORK_SUBNET" in
+        *.*.*.*/*) ;;
+        *) die "AGENT_NETWORK_SUBNET must be an IPv4 CIDR, got \"$AGENT_NETWORK_SUBNET\"" ;;
+    esac
+    case "$AGENT_NETWORK_SUBNET_V6" in
+        *:*/*) ;;
+        *) die "AGENT_NETWORK_SUBNET_V6 must be an IPv6 CIDR, got \"$AGENT_NETWORK_SUBNET_V6\"" ;;
+    esac
+    case "$DOCKER0_CIDR_V6" in
+        *:*/*) ;;
+        *) die "DOCKER0_CIDR_V6 must be an IPv6 CIDR, got \"$DOCKER0_CIDR_V6\"" ;;
+    esac
+    if [ "$AGENT_NETWORK_SUBNET_V6" = "$DOCKER0_CIDR_V6" ]; then
+        die "AGENT_NETWORK_SUBNET_V6 and DOCKER0_CIDR_V6 must differ: Docker refuses two identical pools"
+    fi
+
+    case "$AGENT_DIR" in
+        /*) ;;
+        *) die "AGENT_DIR must be an absolute path, got \"$AGENT_DIR\"" ;;
+    esac
+
+    case "$LOG_MAX_FILE" in
+        ''|*[!0-9]*) die "LOG_MAX_FILE must be a number, got \"$LOG_MAX_FILE\"" ;;
+    esac
+    case "$LOG_MAX_SIZE" in
+        *[0-9]k|*[0-9]m|*[0-9]g|*[0-9]) ;;
+        *) die "LOG_MAX_SIZE must be a size such as 10m or 512k, got \"$LOG_MAX_SIZE\"" ;;
+    esac
+
+    # BIND_ADDRESS is published as "<addr>:<port>:<port>", so an address with
+    # its own colons (IPv6) has to arrive bracketed.
+    case "$BIND_ADDRESS" in
+        ''|*.*.*.*) ;;
+        \[*\]) ;;
+        *:*) die "BIND_ADDRESS with an IPv6 literal must be bracketed, e.g. [2001:db8::1]" ;;
+    esac
+}
+
+# port_binding renders one published port for the compose file. The host port
+# stays a ${VAR} the daemon resolves from .env, so it can be retuned without
+# regenerating anything; BIND_ADDRESS is rendered now, because an empty one has
+# to leave no stray colon behind and compose cannot express that.
+port_binding() {
+    host_port_var="$1"
+    container_port="$2"
+
+    if [ -n "$BIND_ADDRESS" ]; then
+        printf '%s:${%s}:%s' "$BIND_ADDRESS" "$host_port_var" "$container_port"
+        return
+    fi
+    printf '${%s}:%s' "$host_port_var" "$container_port"
 }
 
 # =============================================================================
@@ -760,6 +916,189 @@ detect_compose_mode_optional() {
 }
 
 # =============================================================================
+# Installation check
+# =============================================================================
+
+# Reports drift between what this installer would produce and what is on disk,
+# split by what it costs to fix. A setting missing from .env is picked up by the
+# next automatic update; a network drawn from Docker's default pool, or a
+# compose file with values baked in, only changes on a reinstall — that one
+# recreates the network, which is why it is never done unattended.
+CHECK_NEEDS_REINSTALL=false
+CHECK_FIXABLE=false
+
+check_report_reinstall() {
+    CHECK_NEEDS_REINSTALL=true
+    log_warn "  [reinstall] $1"
+}
+
+check_report_fixable() {
+    CHECK_FIXABLE=true
+    log_info "  [next update] $1"
+}
+
+check_env_file() {
+    env_file="${AGENT_DIR}/.env"
+
+    if [ ! -f "$env_file" ]; then
+        check_report_reinstall ".env is missing: this installation predates it, and the compose file has its values baked in"
+        return 0
+    fi
+
+    for key in AGENT_IMAGE AGENT_TAG TRAEFIK_IMAGE TRAEFIK_VERSION \
+        SSH_TUNNEL_PORT HTTP_PORT HTTPS_PORT ACME_HTTP_PORT \
+        AGENT_NETWORK_SUBNET AGENT_NETWORK_SUBNET_V6 LOG_MAX_SIZE LOG_MAX_FILE; do
+        if ! grep -q "^${key}=" "$env_file"; then
+            check_report_fixable "setting not in .env yet: ${key}"
+        fi
+    done
+}
+
+check_compose_file() {
+    compose_file="${AGENT_DIR}/docker-compose.yml"
+
+    if [ ! -f "$compose_file" ]; then
+        check_report_reinstall "docker-compose.yml is missing from ${AGENT_DIR}"
+        return 0
+    fi
+
+    if ! grep -q '\${AGENT_IMAGE}' "$compose_file"; then
+        check_report_reinstall "docker-compose.yml has its values baked in; it cannot read .env"
+    fi
+    if ! grep -q 'ipam:' "$compose_file"; then
+        check_report_reinstall "the agent network has no pinned subnet, so Docker draws one from its default pool"
+    fi
+}
+
+check_agent_network() {
+    command_exists docker || return 0
+
+    actual="$(docker network inspect netconfig --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null || true)"
+    if [ -z "$actual" ]; then
+        log_info "  agent network not created yet (nothing to compare)"
+        return 0
+    fi
+
+    for subnet in $actual; do
+        case "$subnet" in
+            *:*) continue ;;
+        esac
+        if [ "$subnet" != "$AGENT_NETWORK_SUBNET" ]; then
+            check_report_reinstall "agent network is on ${subnet}, expected ${AGENT_NETWORK_SUBNET}. A device inside ${subnet} is unreachable through this agent"
+        fi
+    done
+}
+
+check_update_script() {
+    if [ ! -f "$UPDATE_SCRIPT" ]; then
+        check_report_reinstall "update.sh is missing: this installation never updates itself"
+        return 0
+    fi
+
+    if ! grep -q 'converge_env_file' "$UPDATE_SCRIPT"; then
+        check_report_reinstall "update.sh predates additive convergence, so new settings never reach this machine on their own"
+    fi
+}
+
+check_containers() {
+    command_exists docker || return 0
+
+    for name in netconfig_agent netconfig_traefik; do
+        state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+        if [ -z "$state" ]; then
+            # A missing container is brought back by `docker compose up -d`;
+            # it says nothing about the installation being out of date.
+            check_report_fixable "container ${name} does not exist"
+        elif [ "$state" != "running" ]; then
+            log_warn "  [attention] container ${name} is ${state}"
+        fi
+    done
+}
+
+run_installation_check() {
+    log_info "Checking the installation in ${AGENT_DIR}..."
+
+    if [ ! -d "$AGENT_DIR" ]; then
+        die "No installation found in ${AGENT_DIR}."
+    fi
+
+    check_env_file
+    check_compose_file
+    check_agent_network
+    check_update_script
+    check_containers
+
+    if [ "$CHECK_NEEDS_REINSTALL" = "true" ]; then
+        log_warn "This installation needs a reinstall to be brought up to date:"
+        log_warn "  cd ${AGENT_DIR} && ./install.sh --reinstall"
+        log_warn "The reinstall recreates the agent network, so the agent is briefly unreachable."
+        return 1
+    fi
+
+    if [ "$CHECK_FIXABLE" = "true" ]; then
+        log_info "Nothing needs a reinstall. What is listed above arrives with the next automatic update, or run ${UPDATE_SCRIPT} now."
+        return 0
+    fi
+
+    log_info "Installation is up to date."
+    return 0
+}
+
+# =============================================================================
+# Environment file
+# =============================================================================
+
+# The compose file reads these at runtime, so an operator can retune a port or
+# swap a registry with `docker compose up -d` — no reinstall, and update.sh
+# keeps whatever they set.
+#
+# Existing keys are never touched: the whole point of the file is that edits
+# survive. Missing ones are appended, which is what makes a NEW setting arrive
+# on an old installation without wiping the operator's choices. A key they
+# commented out counts as missing and comes back, because the compose file
+# needs it — the comment stays where it is, above the value.
+ENV_FILE_HEADER='# NetConfig Agent settings, read by docker compose.
+# Edit a value and run: docker compose up -d
+# The installer only ever appends keys it finds missing here.'
+
+upsert_env_var() {
+    key="$1"
+    value="$2"
+
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    log_info "  ${key}=${value}"
+}
+
+write_env_file() {
+    ENV_FILE="${AGENT_DIR}/.env"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        printf '%s\n\n' "$ENV_FILE_HEADER" > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        log_info "Creating $ENV_FILE"
+    else
+        log_info "Existing $ENV_FILE found. Keeping every value already set."
+    fi
+
+    upsert_env_var AGENT_IMAGE "$AGENT_IMAGE"
+    upsert_env_var AGENT_TAG "$AGENT_TAG"
+    upsert_env_var TRAEFIK_IMAGE "$TRAEFIK_IMAGE"
+    upsert_env_var TRAEFIK_VERSION "$TRAEFIK_VERSION"
+    upsert_env_var SSH_TUNNEL_PORT "$SSH_TUNNEL_PORT"
+    upsert_env_var HTTP_PORT "$HTTP_PORT"
+    upsert_env_var HTTPS_PORT "$HTTPS_PORT"
+    upsert_env_var ACME_HTTP_PORT "$ACME_HTTP_PORT"
+    upsert_env_var AGENT_NETWORK_SUBNET "$AGENT_NETWORK_SUBNET"
+    upsert_env_var AGENT_NETWORK_SUBNET_V6 "$AGENT_NETWORK_SUBNET_V6"
+    upsert_env_var LOG_MAX_SIZE "$LOG_MAX_SIZE"
+    upsert_env_var LOG_MAX_FILE "$LOG_MAX_FILE"
+}
+
+# =============================================================================
 # Reinstall / Wipe
 # =============================================================================
 
@@ -800,7 +1139,7 @@ wipe_previous_installation() {
         local traefik_image
         agent_volume="$(get_agent_data_volume_from_container)"
         project="$(basename "$AGENT_DIR" 2>/dev/null || true)"
-        agent_image="netconfigsup/agent:${AGENT_TAG}"
+        agent_image="${AGENT_IMAGE}:${AGENT_TAG}"
         traefik_image="traefik:${TRAEFIK_VERSION}"
 
         if [ -f "$AGENT_DIR/docker-compose.yml" ]; then
@@ -832,7 +1171,7 @@ wipe_previous_installation() {
         docker image rm -f "$traefik_image" >/dev/null 2>&1 || true
 
         # Also remove any remaining tags for the NetConfig Agent repository.
-        for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^netconfigsup/agent:' || true); do
+        for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E "^${AGENT_IMAGE}:" || true); do
             docker image rm -f "$img" >/dev/null 2>&1 || true
         done
     fi
@@ -849,6 +1188,9 @@ wipe_previous_installation() {
 
 generate_docker_compose() {
     stop_existing_containers
+
+    # Before the compose file, because that file is written in terms of these.
+    write_env_file
 
     log_info "Writing docker-compose.yml to $AGENT_DIR..."
 
@@ -877,7 +1219,7 @@ generate_compose_no_tls() {
     cat > "$AGENT_DIR/docker-compose.yml" <<EOF
 services:
   traefik:
-    image: traefik:${TRAEFIK_VERSION}
+    image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
@@ -891,7 +1233,7 @@ services:
       - "--entryPoints.web.address=:8080"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
-      - "8080:8080"
+      - "$(port_binding HTTP_PORT 8080)"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
@@ -899,15 +1241,15 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:${AGENT_TAG}
+    image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "5"
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     ports:
-      - "2222:2222"
+      - "$(port_binding SSH_TUNNEL_PORT 2222)"
     volumes:
       - agent_data:/data
     networks:
@@ -935,6 +1277,10 @@ networks:
     name: netconfig
     driver: bridge
     enable_ipv6: true
+    ipam:
+      config:
+        - subnet: \${AGENT_NETWORK_SUBNET}
+        - subnet: \${AGENT_NETWORK_SUBNET_V6}
 EOF
 }
 
@@ -942,7 +1288,7 @@ generate_compose_self_signed() {
     cat > "$AGENT_DIR/docker-compose.yml" <<EOF
 services:
   traefik:
-    image: traefik:${TRAEFIK_VERSION}
+    image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
@@ -957,8 +1303,8 @@ services:
       - "--entryPoints.websecure.address=:8443"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
-      - "8080:8080"
-      - "8443:8443"
+      - "$(port_binding HTTP_PORT 8080)"
+      - "$(port_binding HTTPS_PORT 8443)"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
@@ -967,15 +1313,15 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:${AGENT_TAG}
+    image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "5"
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     ports:
-      - "2222:2222"
+      - "$(port_binding SSH_TUNNEL_PORT 2222)"
     volumes:
       - agent_data:/data
     networks:
@@ -1007,6 +1353,10 @@ networks:
     name: netconfig
     driver: bridge
     enable_ipv6: true
+    ipam:
+      config:
+        - subnet: \${AGENT_NETWORK_SUBNET}
+        - subnet: \${AGENT_NETWORK_SUBNET_V6}
 EOF
 }
 
@@ -1017,7 +1367,7 @@ generate_compose_acme() {
     cat > "$AGENT_DIR/docker-compose.yml" <<EOF
 services:
   traefik:
-    image: traefik:${TRAEFIK_VERSION}
+    image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
     restart: unless-stopped
     security_opt:
@@ -1036,9 +1386,9 @@ services:
       - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=acme"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
     ports:
-      - "80:80"
-      - "8080:8080"
-      - "8443:8443"
+      - "$(port_binding ACME_HTTP_PORT 80)"
+      - "$(port_binding HTTP_PORT 8080)"
+      - "$(port_binding HTTPS_PORT 8443)"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
@@ -1047,15 +1397,15 @@ services:
       - local
 
   agent:
-    image: netconfigsup/agent:${AGENT_TAG}
+    image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "5"
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     ports:
-      - "2222:2222"
+      - "$(port_binding SSH_TUNNEL_PORT 2222)"
     volumes:
       - agent_data:/data
     networks:
@@ -1087,6 +1437,10 @@ networks:
     name: netconfig
     driver: bridge
     enable_ipv6: true
+    ipam:
+      config:
+        - subnet: \${AGENT_NETWORK_SUBNET}
+        - subnet: \${AGENT_NETWORK_SUBNET_V6}
 EOF
 
     # Escape special characters for sed
@@ -1144,6 +1498,9 @@ set -eu
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+AGENT_DIR="$AGENT_DIR"
+ENV_FILE="\$AGENT_DIR/.env"
+
 detect_update_compose_mode() {
     if command -v docker-compose >/dev/null 2>&1; then
         printf '%s\n' "docker-compose"
@@ -1159,6 +1516,40 @@ detect_update_compose_mode() {
     return 1
 }
 
+# Additive convergence: a setting introduced after this machine was installed
+# reaches it here, because the compose file reads .env at runtime. Only keys
+# that are MISSING are written — an operator's value is never overwritten, and
+# nothing structural (compose, network, daemon) is touched, so an unattended
+# run can never take the agent down.
+upsert_env_var() {
+    key="\$1"
+    value="\$2"
+
+    if [ -f "\$ENV_FILE" ] && grep -q "^\${key}=" "\$ENV_FILE"; then
+        return 0
+    fi
+
+    printf '%s=%s\n' "\$key" "\$value" >> "\$ENV_FILE"
+    printf '%s\n' "Added missing setting: \${key}=\${value}"
+}
+
+converge_env_file() {
+    [ -f "\$ENV_FILE" ] || return 0
+
+    upsert_env_var AGENT_IMAGE "$AGENT_IMAGE"
+    upsert_env_var AGENT_TAG "$AGENT_TAG"
+    upsert_env_var TRAEFIK_IMAGE "$TRAEFIK_IMAGE"
+    upsert_env_var TRAEFIK_VERSION "$TRAEFIK_VERSION"
+    upsert_env_var SSH_TUNNEL_PORT "$SSH_TUNNEL_PORT"
+    upsert_env_var HTTP_PORT "$HTTP_PORT"
+    upsert_env_var HTTPS_PORT "$HTTPS_PORT"
+    upsert_env_var ACME_HTTP_PORT "$ACME_HTTP_PORT"
+    upsert_env_var AGENT_NETWORK_SUBNET "$AGENT_NETWORK_SUBNET"
+    upsert_env_var AGENT_NETWORK_SUBNET_V6 "$AGENT_NETWORK_SUBNET_V6"
+    upsert_env_var LOG_MAX_SIZE "$LOG_MAX_SIZE"
+    upsert_env_var LOG_MAX_FILE "$LOG_MAX_FILE"
+}
+
 cleanup() {
     rmdir "$UPDATE_LOCK_DIR" >/dev/null 2>&1 || true
 }
@@ -1170,17 +1561,19 @@ fi
 
 trap cleanup EXIT INT TERM
 
-if [ ! -d "$AGENT_DIR" ]; then
-    printf '%s\n' "Agent directory not found: $AGENT_DIR" >&2
+if [ ! -d "\$AGENT_DIR" ]; then
+    printf '%s\n' "Agent directory not found: \$AGENT_DIR" >&2
     exit 1
 fi
 
-cd "$AGENT_DIR"
+cd "\$AGENT_DIR"
 
 if [ ! -f docker-compose.yml ]; then
-    printf '%s\n' "docker-compose.yml not found in $AGENT_DIR" >&2
+    printf '%s\n' "docker-compose.yml not found in \$AGENT_DIR" >&2
     exit 1
 fi
+
+converge_env_file
 
 COMPOSE_MODE="\$(detect_update_compose_mode)"
 
@@ -1293,6 +1686,13 @@ main() {
     log_info "Starting NetConfig Agent installation..."
 
     parse_arguments "$@"
+    validate_settings
+
+    if [ "$CHECK_ONLY" = "true" ]; then
+        run_installation_check
+        return $?
+    fi
+
     check_root
     check_distro
 

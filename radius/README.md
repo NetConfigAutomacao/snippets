@@ -40,6 +40,19 @@ Se o host ja executa outros servicos ou containers:
 - confirme se as portas estão livres;
 - revise com cuidado `--no-install-vm-docker` e `--no-update-vm`.
 
+## Convivência com o NetConfig Agent
+
+O Radius cria a própria rede Docker `radius-internal`, sem faixa fixa: ela é
+sorteada do pool padrão do Docker (`172.17.0.0/16` a `172.31.0.0/16`).
+
+Se o NetConfig Agent estiver instalado na mesma máquina, não há conflito — o
+agente usa uma faixa própria e reservada (`198.19.166.0/24`) e não altera o
+pool padrão, justamente para não mexer em redes de terceiros no host.
+
+Vale a mesma precaução de sempre: nenhum equipamento gerenciado deve estar
+endereçado na faixa que o Docker sorteou para `radius-internal`. Confira com
+`docker network inspect radius-internal`.
+
 ## Flags disponiveis
 
 | Flag                                            | Descricao                                                                                                   |

@@ -30,12 +30,42 @@ curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/he
 - Conectividade com a internet durante e pós instalação para instalação de pacotes, download das imagens Docker e comunicação com o servidor da NetConfig.
 - Pacotes esperados no host: `Docker`, `curl`, `openssl` e `cron` quando o auto update estiver habilitado.
 - Pacote opcional: `jq`, usado para merge mais seguro de configuracao Docker quando necessario.
+- Nenhum equipamento gerenciado endereçado em `198.19.166.0/24` — é a rede interna do agente (ver "Rede interna do agente").
 - Portas liberadas:
   - `2222/tcp` (túnel SSH do agente)
   - `8443/tcp` (HTTPS do agente via Traefik)
   - `8080/tcp` (Opcional: HTTP do agente via Traefik caso não seja possível HTTPS)
   - `80/tcp` (Opcional: utilizada pelo desafio ACME ao usar Let's Encrypt)
 - DNS apontando para o host caso vá utilizar Let's Encrypt.
+
+## Rede interna do agente
+
+O agente roda em container e alcança os equipamentos a partir da rede Docker
+`netconfig`, fixada pelo instalador em:
+
+| Família | Faixa |
+|---|---|
+| IPv4 | `198.19.166.0/24` |
+| IPv6 | `2001:db8:198:166::/64` |
+
+**Nenhum equipamento gerenciado pode estar nessa faixa.** Um endereço dentro
+dela é tratado pelo kernel como vizinho local do container: o tráfego não sai
+da máquina do agente, e o equipamento aparece como inacessível sem que haja
+qualquer problema nele.
+
+A faixa foi escolhida justamente para tornar isso improvável — `198.18.0.0/15`
+é reservada pela RFC 2544 para testes de equipamento de rede, não é atribuída
+pela IANA e não aparece na tabela de roteamento da internet. Antes, o Docker
+sorteava a rede do pool padrão (`172.17.0.0/16` a `172.31.0.0/16`), que colide
+com endereçamento de cliente com frequência.
+
+Se algum equipamento seu já usa `198.19.166.0/24`, avise o suporte antes de
+instalar: a faixa da rede pode ser alterada, mas precisa ser feita antes do
+agente subir.
+
+Instalações feitas antes dessa mudança continuam na faixa sorteada pelo Docker
+até serem reinstaladas. O diagnóstico do equipamento no NetConfig identifica o
+conflito nos dois casos.
 
 ## Aviso para VM compartilhada
 
@@ -54,6 +84,8 @@ O script aceita as seguintes flags de linha de comando:
 | `--no-install-vm-docker`                        | **Não instala** Docker, curl ou openssl. Apenas verifica se estão instalados. Se algum estiver faltando, o script para com erro. Útil quando você gerencia as dependências manualmente. |
 | `--no-update-vm`                                | Pula a atualização seletiva dos pacotes exigidos pelo instalador. Ainda instala dependências se necessário (a menos que `--no-install-vm-docker` também esteja ativa).                    |
 | `--tag VERSION`                                 | Especifica a tag da imagem do agente (padrão: `latest`). Exemplo: `--tag v1.23.1`                                                                                                       |
+| `--reinstall`                                   | **Destrutiva.** Apaga containers, volume de dados e arquivos em `/opt/netconfig-agent` e instala de novo. O agente volta com chaves novas — reregistre-o, ou use o botão de reinstalação no NetConfig, que troca as chaves sozinho. |
+| `--check`                                       | Inspeciona a instalação e relata o que está faltando, sem alterar nada. Sai com `0` quando está em dia e `1` quando algo exige reinstalação.                                             |
 | `--no-auto-update`                              | Não cria o agendamento automático de atualização em `/etc/cron.d/netconfig-agent`.                                                                                                            |
 | `--update-weekday N`                            | Define o dia da semana do update automático (`0-6`). Deve ser usado junto com `--update-hour` e `--update-minute`.                                                                      |
 | `--update-hour N`                               | Define a hora do update automático (`0-23`). Deve ser usado junto com `--update-weekday` e `--update-minute`.                                                                           |
@@ -122,6 +154,69 @@ curl -fsSL ... | sudo sh -s -- --unattended
 | `ACME_EMAIL`  | Email para notificações Let's Encrypt              | `dev@exemplo.com`   |
 | `DISABLE_TLS` | Desabilita HTTPS (HTTP apenas)                     | `true`              |
 | `UNATTENDED`  | Modo não-interativo (equivalente a `--unattended`) | `true`              |
+
+### Instalação avançada
+
+Nada aqui precisa ser editado no script: todos os valores abaixo aceitam
+sobrescrita por variável de ambiente na chamada do instalador. Um valor
+inválido é recusado antes de qualquer instalação, com a mensagem do que se
+esperava.
+
+```sh
+AGENT_DIR=/srv/netconfig-agent \
+SSH_TUNNEL_PORT=2322 \
+BIND_ADDRESS=10.0.0.5 \
+  ./install.sh
+```
+
+| Variável | Padrão | Para que serve |
+| --- | --- | --- |
+| `AGENT_NETWORK_SUBNET` | `198.19.166.0/24` | Rede interna do agente. Troque se a faixa já for usada por equipamento seu |
+| `AGENT_NETWORK_SUBNET_V6` | `2001:db8:198:166::/64` | Mesma rede, IPv6. Precisa ser diferente de `DOCKER0_CIDR_V6` |
+| `SSH_TUNNEL_PORT` | `2222` | Porta publicada do túnel SSH |
+| `HTTP_PORT` | `8080` | Porta publicada do HTTP via Traefik |
+| `HTTPS_PORT` | `8443` | Porta publicada do HTTPS via Traefik |
+| `ACME_HTTP_PORT` | `80` | Porta do desafio ACME (Let's Encrypt) |
+| `BIND_ADDRESS` | vazio (todas as interfaces) | Endereço do host onde as portas são publicadas. Use IPv6 entre colchetes: `[2001:db8::1]` |
+| `AGENT_IMAGE` | `netconfigsup/agent` | Imagem do agente. Aponte para o seu registry espelhado |
+| `AGENT_TAG` | `latest` | Tag da imagem do agente. Equivale a `--tag`, que tem precedência |
+| `TRAEFIK_IMAGE` | `traefik` | Imagem do Traefik |
+| `TRAEFIK_VERSION` | `v3.6.1` | Tag do Traefik |
+| `AGENT_DIR` | `/opt/netconfig-agent` | Diretório da instalação |
+| `SKIP_DOCKER_DAEMON_CONFIG` | `false` | `true` impede o instalador de escrever `daemon.json` e reiniciar o Docker. Exige IPv6 já habilitado no daemon |
+| `DOCKER0_CIDR_V6` | `2001:db8:1::/64` | Prefixo IPv6 da bridge padrão do Docker, exigido junto de `"ipv6": true`. O stack não usa essa bridge |
+| `LOG_MAX_SIZE` | `10m` | Rotação de log dos containers |
+| `LOG_MAX_FILE` | `5` | Quantidade de arquivos de log mantidos |
+
+### Arquivo `.env`
+
+O instalador grava `/opt/netconfig-agent/.env` com os valores que o
+`docker-compose.yml` lê em tempo de execução:
+
+`AGENT_IMAGE`, `AGENT_TAG`, `TRAEFIK_IMAGE`, `TRAEFIK_VERSION`,
+`SSH_TUNNEL_PORT`, `HTTP_PORT`, `HTTPS_PORT`, `ACME_HTTP_PORT`,
+`AGENT_NETWORK_SUBNET`, `AGENT_NETWORK_SUBNET_V6`, `LOG_MAX_SIZE`,
+`LOG_MAX_FILE`.
+
+Isso permite ajustar qualquer um deles depois, sem reinstalar:
+
+```sh
+cd /opt/netconfig-agent
+vim .env
+docker compose up -d
+```
+
+Reexecutar o instalador **nunca sobrescreve valor já presente no arquivo** —
+ele apenas acrescenta as chaves que faltam, que é como uma configuração nova
+chega a uma instalação antiga sem desfazer os ajustes de quem administra.
+
+Uma chave que você comentar conta como ausente e volta com o valor padrão, já
+que o compose precisa dela. Para desativar um ajuste, volte o valor padrão em
+vez de comentar a linha.
+
+As demais variáveis (`AGENT_DIR`, `SKIP_DOCKER_DAEMON_CONFIG`,
+`DOCKER0_CIDR_V6`, `DOMAIN`, `ACME_EMAIL`) são decisões de instalação e não
+entram no `.env`: o compose não as lê.
 
 > **Importante:** Variáveis de ambiente devem ser exportadas antes do comando ou definidas na mesma linha (antes do comando).
 
@@ -203,10 +298,20 @@ O instalador:
   ```bash
   sudo docker logs -f netconfig_agent
   ```
-- Atualizar a imagem do agente via script:
+- Atualizar o agente via script (imagem + configurações novas):
   ```bash
   sudo /opt/netconfig-agent/update.sh
   ```
+  Além de puxar a imagem, ele acrescenta ao `.env` as chaves que passaram a
+  existir desde a instalação, sem tocar nas que já estão lá. É por esse caminho
+  que uma configuração nova chega a uma instalação antiga sem reinstalar.
+- Verificar se a instalação está em dia, sem alterar nada:
+  ```bash
+  sudo /opt/netconfig-agent/install.sh --check
+  ```
+  Ele separa o que o `update.sh` resolve sozinho do que exige reinstalação — a
+  faixa da rede interna, por exemplo, não pode ser renumerada com containers
+  ligados nela.
 - Logs do auto update:
   ```bash
   ls -lah /opt/netconfig-agent/logs/
@@ -225,22 +330,37 @@ Por padrão, o instalador cria `/etc/cron.d/netconfig-agent` para executar o `up
 ```
 /opt/netconfig-agent/
 ├── docker-compose.yml
+├── .env                         # Valores lidos pelo compose (ver "Arquivo .env")
 ├── update.sh
 ├── logs/                        # Logs do auto update via cron
 ├── traefik/
 │   ├── acme/acme.json           # Apenas no modo Let's Encrypt
 │   ├── certs/selfsigned.*       # Apenas no modo autoassinado
 │   └── dynamic/selfsigned.yml   # Referência ao certificado self-signed
-└── agent_data/                  # Persistência do NetConfig Agent
+└── agent_data/                  # Persistência do NetConfig Agent (API key e chave do túnel)
 ```
 
+`agent_data/` é apagado por `--reinstall`, então o agente volta com chaves
+novas. Reinstalando pelo NetConfig isso é transparente — a plataforma troca as
+chaves no cadastro existente, mantendo nome e equipamentos. Reinstalando pela
+linha de comando, reregistre o agente com as chaves exibidas ao final.
+
 ## Solução de problemas
+
+### Equipamento inacessível logo após instalar
+
+Confira primeiro se o endereço do equipamento cai em `198.19.166.0/24` (ou, em
+instalações anteriores a essa mudança, na faixa que o Docker sorteou — veja
+`docker network inspect netconfig`). Nesses casos o tráfego não sai da máquina
+do agente e o sintoma é idêntico ao de um equipamento desligado. O diagnóstico
+do equipamento no NetConfig aponta o conflito diretamente.
 
 - **Let's Encrypt não gera certificado**: verifique DNS, liberação das portas 80/8080/8443 e se nenhum outro serviço está ocupando-as.
 - **Aviso de certificado inválido**: importe `/opt/netconfig-agent/traefik/certs/selfsigned.crt` no trust store (modo autoassinado).
 - **Porta em uso**: finalize serviços que utilizem 80, 8080, 8443 ou 2222 antes de reexecutar o instalador.
 - **Docker não está instalado (com --no-install-vm-docker)**: remova a flag `--no-install-vm-docker` ou instale o Docker manualmente antes de executar o script.
 - **Host com outras aplicações**: revise as opções avançadas antes de repetir o reinstall automático.
+- **Dúvida se a instalação está completa**: rode `sudo /opt/netconfig-agent/install.sh --check`. Ele lista o que falta e diz se resolve com update ou se exige reinstalação.
 
 ## Suporte
 
