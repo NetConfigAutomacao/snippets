@@ -76,6 +76,28 @@ SKIP_DOCKER_DAEMON_CONFIG="${SKIP_DOCKER_DAEMON_CONFIG:-false}"
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-10m}"
 LOG_MAX_FILE="${LOG_MAX_FILE:-5}"
 
+# Agent container resource ceiling. Without it, an agent that spins or leaks
+# takes the whole customer VM down with it, and nothing restarts the container
+# because the process never exits. GOMEMLIMIT sits below the hard mem_limit so
+# the Go GC works harder before the kernel OOM-kills the container — and if it
+# is killed anyway, restart: unless-stopped brings it back, which the host
+# running out of memory does not.
+#
+# Go 1.25 derives GOMAXPROCS from the cgroup CPU bandwidth limit (the agent's
+# go.mod is at go 1.25.0, so the containermaxprocs default applies), so the CPU
+# ceiling below also caps the runtime's own parallelism.
+AGENT_CPU_LIMIT="${AGENT_CPU_LIMIT:-2}"
+AGENT_MEM_LIMIT="${AGENT_MEM_LIMIT:-1g}"
+AGENT_GOMEMLIMIT="${AGENT_GOMEMLIMIT:-768MiB}"
+
+# Traefik ceiling, on the same reasoning. It only fronts this stack's two or
+# three routers, so the ceiling is small — but a Traefik killed by the host
+# running out of memory takes the agent's HTTP surface with it, which is the
+# outage the limit exists to prevent.
+TRAEFIK_CPU_LIMIT="${TRAEFIK_CPU_LIMIT:-1}"
+TRAEFIK_MEM_LIMIT="${TRAEFIK_MEM_LIMIT:-512m}"
+
+
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 readonly CRON_FILE="/etc/cron.d/netconfig-agent"
 readonly MAX_WAIT=300
@@ -947,7 +969,9 @@ check_env_file() {
 
     for key in AGENT_IMAGE AGENT_TAG TRAEFIK_IMAGE TRAEFIK_VERSION \
         SSH_TUNNEL_PORT HTTP_PORT HTTPS_PORT ACME_HTTP_PORT \
-        AGENT_NETWORK_SUBNET AGENT_NETWORK_SUBNET_V6 LOG_MAX_SIZE LOG_MAX_FILE; do
+        AGENT_NETWORK_SUBNET AGENT_NETWORK_SUBNET_V6 LOG_MAX_SIZE LOG_MAX_FILE \
+        AGENT_CPU_LIMIT AGENT_MEM_LIMIT AGENT_GOMEMLIMIT \
+        TRAEFIK_CPU_LIMIT TRAEFIK_MEM_LIMIT; do
         if ! grep -q "^${key}=" "$env_file"; then
             check_report_fixable "setting not in .env yet: ${key}"
         fi
@@ -967,6 +991,11 @@ check_compose_file() {
     fi
     if ! grep -q 'ipam:' "$compose_file"; then
         check_report_reinstall "the agent network has no pinned subnet, so Docker draws one from its default pool"
+    fi
+    # A limit is a compose-level key, so unlike an .env setting it cannot be
+    # converged by update.sh: the file itself has to be rewritten.
+    if ! grep -q 'mem_limit:' "$compose_file"; then
+        check_report_reinstall "the agent container has no CPU or memory ceiling, so a spinning or leaking agent can consume the whole VM"
     fi
 }
 
@@ -1096,6 +1125,11 @@ write_env_file() {
     upsert_env_var AGENT_NETWORK_SUBNET_V6 "$AGENT_NETWORK_SUBNET_V6"
     upsert_env_var LOG_MAX_SIZE "$LOG_MAX_SIZE"
     upsert_env_var LOG_MAX_FILE "$LOG_MAX_FILE"
+    upsert_env_var AGENT_CPU_LIMIT "$AGENT_CPU_LIMIT"
+    upsert_env_var AGENT_MEM_LIMIT "$AGENT_MEM_LIMIT"
+    upsert_env_var AGENT_GOMEMLIMIT "$AGENT_GOMEMLIMIT"
+    upsert_env_var TRAEFIK_CPU_LIMIT "$TRAEFIK_CPU_LIMIT"
+    upsert_env_var TRAEFIK_MEM_LIMIT "$TRAEFIK_MEM_LIMIT"
 }
 
 # =============================================================================
@@ -1221,6 +1255,13 @@ services:
   traefik:
     image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
+    cpus: \${TRAEFIK_CPU_LIMIT}
+    mem_limit: \${TRAEFIK_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -1243,6 +1284,10 @@ services:
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
+    cpus: \${AGENT_CPU_LIMIT}
+    mem_limit: \${AGENT_MEM_LIMIT}
+    environment:
+      - GOMEMLIMIT=\${AGENT_GOMEMLIMIT}
     logging:
       driver: "json-file"
       options:
@@ -1290,6 +1335,13 @@ services:
   traefik:
     image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
+    cpus: \${TRAEFIK_CPU_LIMIT}
+    mem_limit: \${TRAEFIK_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -1315,6 +1367,10 @@ services:
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
+    cpus: \${AGENT_CPU_LIMIT}
+    mem_limit: \${AGENT_MEM_LIMIT}
+    environment:
+      - GOMEMLIMIT=\${AGENT_GOMEMLIMIT}
     logging:
       driver: "json-file"
       options:
@@ -1369,6 +1425,13 @@ services:
   traefik:
     image: \${TRAEFIK_IMAGE}:\${TRAEFIK_VERSION}
     container_name: netconfig_traefik
+    cpus: \${TRAEFIK_CPU_LIMIT}
+    mem_limit: \${TRAEFIK_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -1399,6 +1462,10 @@ services:
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
     container_name: netconfig_agent
+    cpus: \${AGENT_CPU_LIMIT}
+    mem_limit: \${AGENT_MEM_LIMIT}
+    environment:
+      - GOMEMLIMIT=\${AGENT_GOMEMLIMIT}
     logging:
       driver: "json-file"
       options:
@@ -1548,6 +1615,11 @@ converge_env_file() {
     upsert_env_var AGENT_NETWORK_SUBNET_V6 "$AGENT_NETWORK_SUBNET_V6"
     upsert_env_var LOG_MAX_SIZE "$LOG_MAX_SIZE"
     upsert_env_var LOG_MAX_FILE "$LOG_MAX_FILE"
+    upsert_env_var AGENT_CPU_LIMIT "$AGENT_CPU_LIMIT"
+    upsert_env_var AGENT_MEM_LIMIT "$AGENT_MEM_LIMIT"
+    upsert_env_var AGENT_GOMEMLIMIT "$AGENT_GOMEMLIMIT"
+    upsert_env_var TRAEFIK_CPU_LIMIT "$TRAEFIK_CPU_LIMIT"
+    upsert_env_var TRAEFIK_MEM_LIMIT "$TRAEFIK_MEM_LIMIT"
 }
 
 cleanup() {

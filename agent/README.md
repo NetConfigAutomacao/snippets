@@ -187,6 +187,11 @@ BIND_ADDRESS=10.0.0.5 \
 | `DOCKER0_CIDR_V6` | `2001:db8:1::/64` | Prefixo IPv6 da bridge padrão do Docker, exigido junto de `"ipv6": true`. O stack não usa essa bridge |
 | `LOG_MAX_SIZE` | `10m` | Rotação de log dos containers |
 | `LOG_MAX_FILE` | `5` | Quantidade de arquivos de log mantidos |
+| `AGENT_CPU_LIMIT` | `2` | Teto de CPU do container do agente. O Go 1.25 deriva o `GOMAXPROCS` desse limite |
+| `AGENT_MEM_LIMIT` | `1g` | Teto de memória do container. Sem ele, um agente que vaza memória derruba a VM inteira |
+| `AGENT_GOMEMLIMIT` | `768MiB` | Alvo de memória do coletor de lixo do Go, abaixo do teto acima, para que o GC reaja antes do OOM kill |
+| `TRAEFIK_CPU_LIMIT` | `1` | Teto de CPU do container do Traefik |
+| `TRAEFIK_MEM_LIMIT` | `512m` | Teto de memória do Traefik. Um Traefik morto pela falta de memória do host derruba o acesso HTTP ao agente |
 
 ### Arquivo `.env`
 
@@ -196,7 +201,8 @@ O instalador grava `/opt/netconfig-agent/.env` com os valores que o
 `AGENT_IMAGE`, `AGENT_TAG`, `TRAEFIK_IMAGE`, `TRAEFIK_VERSION`,
 `SSH_TUNNEL_PORT`, `HTTP_PORT`, `HTTPS_PORT`, `ACME_HTTP_PORT`,
 `AGENT_NETWORK_SUBNET`, `AGENT_NETWORK_SUBNET_V6`, `LOG_MAX_SIZE`,
-`LOG_MAX_FILE`.
+`LOG_MAX_FILE`, `AGENT_CPU_LIMIT`, `AGENT_MEM_LIMIT`, `AGENT_GOMEMLIMIT`,
+`TRAEFIK_CPU_LIMIT`, `TRAEFIK_MEM_LIMIT`.
 
 Isso permite ajustar qualquer um deles depois, sem reinstalar:
 
