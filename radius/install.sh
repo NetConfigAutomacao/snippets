@@ -599,6 +599,13 @@ generate_docker_compose() {
   traefik:
     image: traefik:${TRAEFIK_VERSION}
     container_name: netconfig_radius_traefik
+    cpus: \${RADIUS_TRAEFIK_CPU_LIMIT:-1}
+    mem_limit: \${RADIUS_TRAEFIK_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${RADIUS_LOG_MAX_SIZE:-10m}"
+        max-file: "\${RADIUS_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -666,6 +673,13 @@ compose_db_service() {
   radius-db:
     image: netconfigsup/radius-db:${RADIUS_TAG}
     container_name: netconfig_radius_db
+    cpus: ${RADIUS_DB_CPU_LIMIT:-2}
+    mem_limit: ${RADIUS_DB_MEM_LIMIT:-1g}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${RADIUS_LOG_MAX_SIZE:-10m}"
+        max-file: "${RADIUS_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -686,11 +700,19 @@ compose_api_service() {
   radius-api:
     image: netconfigsup/radius-api:${RADIUS_TAG}
     container_name: netconfig_radius_api
+    cpus: ${RADIUS_API_CPU_LIMIT:-1}
+    mem_limit: ${RADIUS_API_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${RADIUS_LOG_MAX_SIZE:-10m}"
+        max-file: "${RADIUS_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     depends_on:
       radius-db:
         condition: service_healthy
     environment:
+      GOMEMLIMIT: ${RADIUS_API_GOMEMLIMIT:-384MiB}
       RADIUS_API_KEY: ${RADIUS_API_KEY}
       RADIUS_DB_DSN: raduser:radpass@tcp(radius-db:3306)/raddb?parseTime=true&tls=false
       RADIUS_ITEMS_PER_PAGE: 100
@@ -707,6 +729,13 @@ compose_server_service() {
   radius-server:
     image: netconfigsup/radius-server:${RADIUS_TAG}
     container_name: netconfig_radius_server
+    cpus: ${RADIUS_SERVER_CPU_LIMIT:-1}
+    mem_limit: ${RADIUS_SERVER_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${RADIUS_LOG_MAX_SIZE:-10m}"
+        max-file: "${RADIUS_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     depends_on:
       radius-db:

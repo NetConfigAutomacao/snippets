@@ -110,6 +110,31 @@ Exemplo:
 sudo RADIUS_API_KEY="minha-chave-radius" radius/install.sh --tag v1.2.3
 ```
 
+## Limites de recursos dos containers
+
+Cada container tem teto de CPU e memoria, para que um servico que trave ou vaze
+memoria nao consuma a VM inteira. Os valores abaixo sao os padroes; para mudar
+qualquer um, acrescente a chave ao `/opt/netconfig-radius/.env` e rode
+`docker compose up -d` — o compose le a variavel em tempo de execucao e usa o
+padrao quando ela nao existe.
+
+| Container | CPU | Memoria | Chaves |
+| --- | --- | --- | --- |
+| `netconfig_radius_db` | `2` | `1g` | `RADIUS_DB_CPU_LIMIT`, `RADIUS_DB_MEM_LIMIT` |
+| `netconfig_radius_api` | `1` | `512m` | `RADIUS_API_CPU_LIMIT`, `RADIUS_API_MEM_LIMIT`, `RADIUS_API_GOMEMLIMIT` (`384MiB`) |
+| `netconfig_radius_server` | `1` | `512m` | `RADIUS_SERVER_CPU_LIMIT`, `RADIUS_SERVER_MEM_LIMIT` |
+| `netconfig_radius_traefik` | `1` | `512m` | `RADIUS_TRAEFIK_CPU_LIMIT`, `RADIUS_TRAEFIK_MEM_LIMIT` |
+
+O teto somado e 2,5 GB, dentro dos 4 GB exigidos nos pre-requisitos.
+
+Os quatro containers tambem passaram a rotacionar o log do Docker
+(`RADIUS_LOG_MAX_SIZE`, padrao `10m`, e `RADIUS_LOG_MAX_FILE`, padrao `5`);
+antes disso o `json-file` crescia sem limite ate encher o disco.
+
+Os limites vivem no `docker-compose.yml`, entao chegam a uma instalacao ja
+existente somente quando o instalador roda de novo — o `update.sh` nao reescreve
+o compose.
+
 ## Como funciona o acesso HTTPS
 
 - O HTTPS e aplicado no acesso externo da API pelo Traefik (`9443/tcp`).
