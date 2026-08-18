@@ -90,6 +90,7 @@ O script aceita as seguintes flags de linha de comando:
 | `--update-weekday N`                            | Define o dia da semana do update automático (`0-6`). Deve ser usado junto com `--update-hour` e `--update-minute`.                                                                      |
 | `--update-hour N`                               | Define a hora do update automático (`0-23`). Deve ser usado junto com `--update-weekday` e `--update-minute`.                                                                           |
 | `--update-minute N`                             | Define o minuto do update automático (`0-59`). Deve ser usado junto com `--update-weekday` e `--update-hour`.                                                                           |
+| `--no-time-sync`                                | Pula a verificação de relógio. O instalador apenas **informa** o estado do relógio — nunca instala, configura nem ajusta nada.                                                            |
 | `--help`, `-h`                                  | Exibe mensagem de ajuda e sai.                                                                                                                                                          |
 
 Se nenhum dos três parâmetros `--update-*` for informado, o instalador escolhe automaticamente:
@@ -154,6 +155,7 @@ curl -fsSL ... | sudo sh -s -- --unattended
 | `ACME_EMAIL`  | Email para notificações Let's Encrypt              | `dev@exemplo.com`   |
 | `DISABLE_TLS` | Desabilita HTTPS (HTTP apenas)                     | `true`              |
 | `UNATTENDED`  | Modo não-interativo (equivalente a `--unattended`) | `true`              |
+| `NETCONFIG_URL` | Backend NetConfig usado para medir o relógio (padrão `https://app.netconfig.com.br`) | `https://netconfig.cliente.com.br` |
 
 ### Instalação avançada
 
@@ -211,6 +213,59 @@ O instalador grava `/opt/netconfig-agent/.env` com os valores que o
 `TRAEFIK_CPU_LIMIT`, `TRAEFIK_MEM_LIMIT`, `AUTOHEAL_IMAGE`, `AUTOHEAL_VERSION`,
 `AUTOHEAL_INTERVAL`, `AUTOHEAL_START_PERIOD`, `AUTOHEAL_CPU_LIMIT`,
 `AUTOHEAL_MEM_LIMIT`.
+
+## Relógio da VM
+
+O agente assina cada requisição com um timestamp e recusa qualquer uma que
+esteja a mais de **300 segundos** do próprio relógio. Fora dessa janela ele não
+responde mais **nada** — ping, SNMP, proxy SSH e diagnóstico falham juntos, e a
+tela do NetConfig mostra o agente como se estivesse morto.
+
+O caso comum é a VM sem nenhum serviço de horário: `timedatectl set-ntp true`
+responde `Failed to set ntp: NTP not supported` quando não há
+`systemd-timesyncd` nem `chrony` instalado.
+
+O instalador (e o `--check`) verifica e **avisa**, sem mexer na máquina:
+
+- nomeia o serviço NTP em execução, ou avisa que não há nenhum;
+- mede a diferença contra o header `Date` do próprio servidor NetConfig — é
+  esse o relógio com que o HMAC é comparado, não um servidor NTP público;
+- passando de 60 s, avisa que o agente vai responder 401 a tudo até o relógio
+  ser corrigido, e que a API key **não** é a causa;
+- imprime o procedimento a executar, e segue com a instalação de qualquer
+  forma: o agente instala normalmente, só não autentica enquanto o relógio
+  estiver errado.
+
+Instalar o serviço de horário é decisão de quem administra a VM. O
+procedimento impresso é o do [guia do NTP.br](https://ntp.br/guia/linux/),
+publicado pelo NIC.br:
+
+```sh
+apt-get install -y chrony
+
+# drop-in, sem reescrever um /etc/chrony/chrony.conf existente
+cat > /etc/chrony/conf.d/ntp-br.conf <<EOF
+server a.st1.ntp.br iburst nts
+server b.st1.ntp.br iburst nts
+server c.st1.ntp.br iburst nts
+server d.st1.ntp.br iburst nts
+server e.st1.ntp.br iburst nts
+server gps.nu.ntp.br iburst nts
+server gps.jd.ntp.br iburst nts
+server gps.ce.ntp.br iburst nts
+EOF
+
+systemctl enable --now chrony
+chronyc makestep    # diferença grande levaria horas no slew padrão
+chronyc tracking    # confere; veja também chronyc sources
+```
+
+`nts` exige chrony 4.0 ou mais novo (`chronyd --version`) e TCP/4460 liberado
+para a troca de chaves; em versões antigas, remova a palavra `nts`. O NTP em si
+usa UDP/123.
+
+Em container, o relógio pertence ao **host**: o instalador aponta isso e não
+imprime procedimento para rodar dentro da VM.
 
 ## Reinício automático (autoheal)
 

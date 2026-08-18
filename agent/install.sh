@@ -113,6 +113,13 @@ AUTOHEAL_MEM_LIMIT="${AUTOHEAL_MEM_LIMIT:-128m}"
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 readonly CRON_FILE="/etc/cron.d/netconfig-agent"
 readonly MAX_WAIT=300
+# The clock the agent's HMAC timestamps are compared against. Overridable for
+# on-premise installs, whose backend is not the SaaS URL.
+NETCONFIG_URL="${NETCONFIG_URL:-https://app.netconfig.com.br}"
+# Beyond this many seconds of drift the agent is at real risk: its own window
+# is +/-300 s, and a clock already a minute out is not being disciplined by
+# anything.
+readonly MAX_CLOCK_OFFSET=60
 readonly WAIT_INTERVAL=5
 
 # Derived from AGENT_DIR, so an override moves the whole tree.
@@ -128,6 +135,7 @@ UNATTENDED=false
 NO_INSTALL_VM_DOCKER=false
 NO_UPDATE_VM=false
 NO_AUTO_UPDATE=false
+NO_TIME_SYNC=false
 REINSTALL=false
 CHECK_ONLY=false
 DOMAIN=""
@@ -367,6 +375,10 @@ parse_arguments() {
                 NO_AUTO_UPDATE=true
                 shift
                 ;;
+            --no-time-sync)
+                NO_TIME_SYNC=true
+                shift
+                ;;
             --update-weekday)
                 validate_integer_range "$2" 0 6 "--update-weekday"
                 UPDATE_WEEKDAY="$2"
@@ -415,6 +427,8 @@ Options:
   --no-update-vm    Skip system package update (apt-get update/upgrade)
   --tag VERSION     Specify agent image tag (default: latest)
   --no-auto-update  Do not create the automatic update cron job
+  --no-time-sync    Skip the clock check. The installer only REPORTS the
+                    clock; it never installs, configures or steps anything.
   --update-weekday N
                     Weekday for automatic updates (0-6)
   --update-hour N   Hour for automatic updates (0-23)
@@ -701,6 +715,136 @@ port_binding() {
 # =============================================================================
 # TLS Configuration
 # =============================================================================
+
+# =============================================================================
+# Clock Check
+# =============================================================================
+
+# The agent signs every request with a timestamp and rejects anything more than
+# 300 s from its own clock, so a drifted VM answers NOTHING — ping, SNMP, SSH
+# proxy and diagnose fail together and it reads like a dead agent. A VM with no
+# NTP daemon is the common case: `timedatectl set-ntp true` answers
+# "Failed to set ntp: NTP not supported" when neither systemd-timesyncd nor
+# chrony is installed.
+#
+# This step only REPORTS. It never installs a package, never edits a config and
+# never steps the clock: the VM belongs to the customer, and a time source is
+# their decision. It also never fails the installation — the agent installs
+# fine, it just will not authenticate until the clock is fixed.
+check_time_sync() {
+    local ntp_service
+    local offset
+
+    log_info "Checking the VM clock..."
+
+    ntp_service=$(detect_ntp_service)
+    if [ -n "$ntp_service" ]; then
+        log_info "Time synchronization service detected: ${ntp_service}."
+    else
+        log_warn "No time synchronization service is running on this VM."
+        print_time_sync_instructions
+    fi
+
+    offset=$(measure_clock_offset)
+    if [ -z "$offset" ]; then
+        log_warn "Could not measure the clock against ${NETCONFIG_URL} (no answer, or no Date header)."
+        log_warn "Check it by hand before registering the agent: run 'date -u' and compare with the NetConfig server."
+        return 0
+    fi
+
+    log_info "Clock offset against ${NETCONFIG_URL}: ${offset}s (this VM minus the server)."
+    if [ "${offset#-}" -le "$MAX_CLOCK_OFFSET" ]; then
+        return 0
+    fi
+
+    log_warn "This VM's clock is ${offset}s away from the NetConfig server."
+    log_warn "The agent rejects any request more than 300s off, so it will answer 401 to every"
+    log_warn "NetConfig request until the clock is corrected — the API key is NOT the problem."
+    print_time_sync_instructions
+    return 0
+}
+
+# detect_ntp_service names the running time source, or nothing when there is
+# none. NTPSynchronized alone is not enough: it stays "yes" for a while after a
+# service that has since stopped.
+detect_ntp_service() {
+    local unit
+
+    for unit in chrony chronyd systemd-timesyncd ntpsec ntp; do
+        if systemctl is-active "$unit" >/dev/null 2>&1; then
+            printf '%s' "$unit"
+            return 0
+        fi
+    done
+
+    if command_exists timedatectl && [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
+        printf 'unknown (timedatectl reports the clock as synchronized)'
+    fi
+}
+
+# measure_clock_offset returns this VM's clock minus the NetConfig server's, in
+# seconds, using the server's own Date header. A public NTP server is a proxy
+# for that clock, not the thing the agent's HMAC is compared against.
+measure_clock_offset() {
+    local remote_date
+    local remote_epoch
+    local local_epoch
+
+    command_exists curl || return 0
+
+    remote_date=$(curl -sS -I --max-time 10 "$NETCONFIG_URL" 2>/dev/null \
+        | tr -d '\r' \
+        | sed -n 's/^[Dd]ate: //p' \
+        | tail -n 1)
+    [ -n "$remote_date" ] || return 0
+
+    remote_epoch=$(date -d "$remote_date" +%s 2>/dev/null) || return 0
+    [ -n "$remote_epoch" ] || return 0
+    local_epoch=$(date +%s)
+
+    printf '%s' "$((local_epoch - remote_epoch))"
+}
+
+# print_time_sync_instructions names exactly what the operator has to run. The
+# servers are the NTP.br stratum-1 set from https://ntp.br/guia/linux/, the
+# procedure published by the Brazilian NTP authority (NIC.br), which recommends
+# chrony as the client. `nts` needs chrony 4.0+ and TCP/4460 open for the key
+# exchange; drop the keyword on an older chrony or it cannot parse its config.
+print_time_sync_instructions() {
+    printf '\n'
+    printf 'Fix the VM clock before registering this agent (run as root):\n'
+    printf '\n'
+    if [ -n "$(systemd-detect-virt -c 2>/dev/null)" ]; then
+        printf '  This machine is a container: its clock belongs to the HOST.\n'
+        printf '  Install and configure the time source on the host, not here.\n'
+        printf '\n'
+        return 0
+    fi
+    printf '  1. apt-get install -y chrony\n'
+    printf '  2. Add the NTP.br stratum-1 servers as a drop-in, WITHOUT touching\n'
+    printf '     an existing /etc/chrony/chrony.conf:\n'
+    printf '\n'
+    printf '     cat > /etc/chrony/conf.d/ntp-br.conf <<EOF\n'
+    printf '     server a.st1.ntp.br iburst nts\n'
+    printf '     server b.st1.ntp.br iburst nts\n'
+    printf '     server c.st1.ntp.br iburst nts\n'
+    printf '     server d.st1.ntp.br iburst nts\n'
+    printf '     server e.st1.ntp.br iburst nts\n'
+    printf '     server gps.nu.ntp.br iburst nts\n'
+    printf '     server gps.jd.ntp.br iburst nts\n'
+    printf '     server gps.ce.ntp.br iburst nts\n'
+    printf '     EOF\n'
+    printf '\n'
+    printf '     (chrony older than 4.0 does not support nts: drop the keyword.\n'
+    printf '      Check with: chronyd --version)\n'
+    printf '  3. systemctl enable --now chrony\n'
+    printf '  4. chronyc makestep      # a large gap would take hours to slew\n'
+    printf '  5. chronyc tracking      # confirm; see also chronyc sources\n'
+    printf '\n'
+    printf '  Firewall: UDP/123 outbound, plus TCP/4460 when nts is used.\n'
+    printf '  Reference: https://ntp.br/guia/linux/\n'
+    printf '\n'
+}
 
 configure_tls() {
     # Load from environment variables
@@ -1073,6 +1217,10 @@ run_installation_check() {
     check_agent_network
     check_update_script
     check_containers
+    # A clock is not an installation state, so it never sets CHECK_NEEDS_REINSTALL
+    # — reinstalling cannot fix it — but "--check" is exactly where an operator
+    # looks when the agent stopped answering.
+    [ "$NO_TIME_SYNC" = "true" ] || check_time_sync
 
     if [ "$CHECK_NEEDS_REINSTALL" = "true" ]; then
         log_warn "This installation needs a reinstall to be brought up to date:"
@@ -1934,6 +2082,12 @@ main() {
         cron_installed || die "cron not found and --no-auto-update was set. Install cron and retry."
     else
         install_cron
+    fi
+
+    if [ "$NO_TIME_SYNC" = "true" ]; then
+        log_info "Skipping the clock check (NO_TIME_SYNC=true)."
+    else
+        check_time_sync
     fi
 
     configure_tls
