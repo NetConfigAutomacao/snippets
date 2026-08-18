@@ -97,6 +97,18 @@ AGENT_GOMEMLIMIT="${AGENT_GOMEMLIMIT:-768MiB}"
 TRAEFIK_CPU_LIMIT="${TRAEFIK_CPU_LIMIT:-1}"
 TRAEFIK_MEM_LIMIT="${TRAEFIK_MEM_LIMIT:-512m}"
 
+# autoheal restarts a container whose healthcheck went unhealthy — the gap the
+# limits above leave open: `restart: unless-stopped` only reacts to a process
+# that EXITS, so an agent wedged but alive stays wedged forever. It watches only
+# containers labelled autoheal=true, through the Docker socket, and mirrors the
+# production stack's own service.
+AUTOHEAL_IMAGE="${AUTOHEAL_IMAGE:-willfarrell/autoheal}"
+AUTOHEAL_VERSION="${AUTOHEAL_VERSION:-latest}"
+AUTOHEAL_INTERVAL="${AUTOHEAL_INTERVAL:-30}"
+AUTOHEAL_START_PERIOD="${AUTOHEAL_START_PERIOD:-300}"
+AUTOHEAL_CPU_LIMIT="${AUTOHEAL_CPU_LIMIT:-0.5}"
+AUTOHEAL_MEM_LIMIT="${AUTOHEAL_MEM_LIMIT:-128m}"
+
 
 readonly DOCKER_CONFIG_FILE="/etc/docker/daemon.json"
 readonly CRON_FILE="/etc/cron.d/netconfig-agent"
@@ -971,7 +983,9 @@ check_env_file() {
         SSH_TUNNEL_PORT HTTP_PORT HTTPS_PORT ACME_HTTP_PORT \
         AGENT_NETWORK_SUBNET AGENT_NETWORK_SUBNET_V6 LOG_MAX_SIZE LOG_MAX_FILE \
         AGENT_CPU_LIMIT AGENT_MEM_LIMIT AGENT_GOMEMLIMIT \
-        TRAEFIK_CPU_LIMIT TRAEFIK_MEM_LIMIT; do
+        TRAEFIK_CPU_LIMIT TRAEFIK_MEM_LIMIT \
+        AUTOHEAL_IMAGE AUTOHEAL_VERSION AUTOHEAL_INTERVAL AUTOHEAL_START_PERIOD \
+        AUTOHEAL_CPU_LIMIT AUTOHEAL_MEM_LIMIT; do
         if ! grep -q "^${key}=" "$env_file"; then
             check_report_fixable "setting not in .env yet: ${key}"
         fi
@@ -996,6 +1010,9 @@ check_compose_file() {
     # converged by update.sh: the file itself has to be rewritten.
     if ! grep -q 'mem_limit:' "$compose_file"; then
         check_report_reinstall "the agent container has no CPU or memory ceiling, so a spinning or leaking agent can consume the whole VM"
+    fi
+    if ! grep -q 'container_name: netconfig_autoheal' "$compose_file"; then
+        check_report_reinstall "there is no autoheal container, so a container that hangs while its process stays alive is never restarted"
     fi
 }
 
@@ -1130,6 +1147,12 @@ write_env_file() {
     upsert_env_var AGENT_GOMEMLIMIT "$AGENT_GOMEMLIMIT"
     upsert_env_var TRAEFIK_CPU_LIMIT "$TRAEFIK_CPU_LIMIT"
     upsert_env_var TRAEFIK_MEM_LIMIT "$TRAEFIK_MEM_LIMIT"
+    upsert_env_var AUTOHEAL_IMAGE "$AUTOHEAL_IMAGE"
+    upsert_env_var AUTOHEAL_VERSION "$AUTOHEAL_VERSION"
+    upsert_env_var AUTOHEAL_INTERVAL "$AUTOHEAL_INTERVAL"
+    upsert_env_var AUTOHEAL_START_PERIOD "$AUTOHEAL_START_PERIOD"
+    upsert_env_var AUTOHEAL_CPU_LIMIT "$AUTOHEAL_CPU_LIMIT"
+    upsert_env_var AUTOHEAL_MEM_LIMIT "$AUTOHEAL_MEM_LIMIT"
 }
 
 # =============================================================================
@@ -1273,6 +1296,9 @@ services:
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.web.address=:8080"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
+      - "--entryPoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
     ports:
       - "$(port_binding HTTP_PORT 8080)"
     volumes:
@@ -1280,6 +1306,14 @@ services:
       - "./traefik/dynamic:/etc/traefik/dynamic:ro"
     networks:
       - local
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
@@ -1301,6 +1335,7 @@ services:
       - local
     labels:
       - "agent.stack=true"
+      - "autoheal=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -1313,6 +1348,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Restarts any container in this stack whose healthcheck reports unhealthy.
+  # restart: unless-stopped covers a process that exits; this covers one that
+  # stays up and stops answering — the failure a memory or CPU ceiling turns
+  # into a hang rather than a crash. Mirrors the production stack's own service.
+  autoheal:
+    image: \${AUTOHEAL_IMAGE}:\${AUTOHEAL_VERSION}
+    container_name: netconfig_autoheal
+    cpus: \${AUTOHEAL_CPU_LIMIT}
+    mem_limit: \${AUTOHEAL_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=\${AUTOHEAL_INTERVAL}
+      - AUTOHEAL_START_PERIOD=\${AUTOHEAL_START_PERIOD}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      # Read-write on purpose: restarting a container is a write. It is also
+      # root-equivalent on this host, which is why nothing else in this stack
+      # gets the socket unrestricted.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+    restart: unless-stopped
+    networks:
+      - local
 
 volumes:
   agent_data:
@@ -1354,6 +1418,9 @@ services:
       - "--entryPoints.web.address=:8080"
       - "--entryPoints.websecure.address=:8443"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
+      - "--entryPoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
     ports:
       - "$(port_binding HTTP_PORT 8080)"
       - "$(port_binding HTTPS_PORT 8443)"
@@ -1363,6 +1430,14 @@ services:
       - "./traefik/certs:/etc/traefik/certs:ro"
     networks:
       - local
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
@@ -1384,6 +1459,7 @@ services:
       - local
     labels:
       - "agent.stack=true"
+      - "autoheal=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -1400,6 +1476,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Restarts any container in this stack whose healthcheck reports unhealthy.
+  # restart: unless-stopped covers a process that exits; this covers one that
+  # stays up and stops answering — the failure a memory or CPU ceiling turns
+  # into a hang rather than a crash. Mirrors the production stack's own service.
+  autoheal:
+    image: \${AUTOHEAL_IMAGE}:\${AUTOHEAL_VERSION}
+    container_name: netconfig_autoheal
+    cpus: \${AUTOHEAL_CPU_LIMIT}
+    mem_limit: \${AUTOHEAL_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=\${AUTOHEAL_INTERVAL}
+      - AUTOHEAL_START_PERIOD=\${AUTOHEAL_START_PERIOD}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      # Read-write on purpose: restarting a container is a write. It is also
+      # root-equivalent on this host, which is why nothing else in this stack
+      # gets the socket unrestricted.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+    restart: unless-stopped
+    networks:
+      - local
 
 volumes:
   agent_data:
@@ -1448,6 +1553,9 @@ services:
       - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=acme"
       - "--providers.docker.constraints=Label(\"agent.stack\",\"true\")"
+      - "--entryPoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
     ports:
       - "$(port_binding ACME_HTTP_PORT 80)"
       - "$(port_binding HTTP_PORT 8080)"
@@ -1458,6 +1566,14 @@ services:
       - "./traefik/acme:/letsencrypt"
     networks:
       - local
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   agent:
     image: \${AGENT_IMAGE}:\${AGENT_TAG}
@@ -1479,6 +1595,7 @@ services:
       - local
     labels:
       - "agent.stack=true"
+      - "autoheal=true"
       - "traefik.enable=true"
       - "traefik.http.services.netconfig.loadbalancer.server.port=8000"
       - "traefik.http.routers.netconfig-http.rule=PathPrefix(\`/\`)"
@@ -1495,6 +1612,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Restarts any container in this stack whose healthcheck reports unhealthy.
+  # restart: unless-stopped covers a process that exits; this covers one that
+  # stays up and stops answering — the failure a memory or CPU ceiling turns
+  # into a hang rather than a crash. Mirrors the production stack's own service.
+  autoheal:
+    image: \${AUTOHEAL_IMAGE}:\${AUTOHEAL_VERSION}
+    container_name: netconfig_autoheal
+    cpus: \${AUTOHEAL_CPU_LIMIT}
+    mem_limit: \${AUTOHEAL_MEM_LIMIT}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "\${LOG_MAX_SIZE}"
+        max-file: "\${LOG_MAX_FILE}"
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=\${AUTOHEAL_INTERVAL}
+      - AUTOHEAL_START_PERIOD=\${AUTOHEAL_START_PERIOD}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      # Read-write on purpose: restarting a container is a write. It is also
+      # root-equivalent on this host, which is why nothing else in this stack
+      # gets the socket unrestricted.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+    restart: unless-stopped
+    networks:
+      - local
 
 volumes:
   agent_data:
@@ -1620,6 +1766,12 @@ converge_env_file() {
     upsert_env_var AGENT_GOMEMLIMIT "$AGENT_GOMEMLIMIT"
     upsert_env_var TRAEFIK_CPU_LIMIT "$TRAEFIK_CPU_LIMIT"
     upsert_env_var TRAEFIK_MEM_LIMIT "$TRAEFIK_MEM_LIMIT"
+    upsert_env_var AUTOHEAL_IMAGE "$AUTOHEAL_IMAGE"
+    upsert_env_var AUTOHEAL_VERSION "$AUTOHEAL_VERSION"
+    upsert_env_var AUTOHEAL_INTERVAL "$AUTOHEAL_INTERVAL"
+    upsert_env_var AUTOHEAL_START_PERIOD "$AUTOHEAL_START_PERIOD"
+    upsert_env_var AUTOHEAL_CPU_LIMIT "$AUTOHEAL_CPU_LIMIT"
+    upsert_env_var AUTOHEAL_MEM_LIMIT "$AUTOHEAL_MEM_LIMIT"
 }
 
 cleanup() {

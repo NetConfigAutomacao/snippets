@@ -192,6 +192,12 @@ BIND_ADDRESS=10.0.0.5 \
 | `AGENT_GOMEMLIMIT` | `768MiB` | Alvo de memória do coletor de lixo do Go, abaixo do teto acima, para que o GC reaja antes do OOM kill |
 | `TRAEFIK_CPU_LIMIT` | `1` | Teto de CPU do container do Traefik |
 | `TRAEFIK_MEM_LIMIT` | `512m` | Teto de memória do Traefik. Um Traefik morto pela falta de memória do host derruba o acesso HTTP ao agente |
+| `AUTOHEAL_IMAGE` | `willfarrell/autoheal` | Imagem do autoheal, que reinicia container marcado como `unhealthy` |
+| `AUTOHEAL_VERSION` | `latest` | Tag do autoheal |
+| `AUTOHEAL_INTERVAL` | `30` | Intervalo, em segundos, entre verificações de saúde |
+| `AUTOHEAL_START_PERIOD` | `300` | Carência, em segundos, antes de considerar reiniciar um container recém-subido |
+| `AUTOHEAL_CPU_LIMIT` | `0.5` | Teto de CPU do autoheal |
+| `AUTOHEAL_MEM_LIMIT` | `128m` | Teto de memória do autoheal |
 
 ### Arquivo `.env`
 
@@ -202,7 +208,27 @@ O instalador grava `/opt/netconfig-agent/.env` com os valores que o
 `SSH_TUNNEL_PORT`, `HTTP_PORT`, `HTTPS_PORT`, `ACME_HTTP_PORT`,
 `AGENT_NETWORK_SUBNET`, `AGENT_NETWORK_SUBNET_V6`, `LOG_MAX_SIZE`,
 `LOG_MAX_FILE`, `AGENT_CPU_LIMIT`, `AGENT_MEM_LIMIT`, `AGENT_GOMEMLIMIT`,
-`TRAEFIK_CPU_LIMIT`, `TRAEFIK_MEM_LIMIT`.
+`TRAEFIK_CPU_LIMIT`, `TRAEFIK_MEM_LIMIT`, `AUTOHEAL_IMAGE`, `AUTOHEAL_VERSION`,
+`AUTOHEAL_INTERVAL`, `AUTOHEAL_START_PERIOD`, `AUTOHEAL_CPU_LIMIT`,
+`AUTOHEAL_MEM_LIMIT`.
+
+## Reinício automático (autoheal)
+
+O stack inclui o container `netconfig_autoheal`, o mesmo usado em produção. Ele
+observa os containers marcados com a label `autoheal=true` — hoje o agente e o
+Traefik — e reinicia aquele cujo healthcheck passar para `unhealthy`.
+
+Isso cobre a falha que o `restart: unless-stopped` não cobre: um processo que
+continua vivo mas parou de responder. O `restart` só reage a processo que
+termina.
+
+Para o Traefik ter healthcheck, o instalador habilita o `/ping` num entrypoint
+interno (`:8082`), que **não** é publicado no host — de fora, esse caminho
+responde 404.
+
+O autoheal monta o socket do Docker em modo leitura e escrita, porque reiniciar
+container é escrita. Isso equivale a root na máquina: é o único container do
+stack com esse acesso, e nenhum outro deve receber.
 
 Isso permite ajustar qualquer um deles depois, sem reinstalar:
 
