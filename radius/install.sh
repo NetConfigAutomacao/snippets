@@ -616,6 +616,9 @@ generate_docker_compose() {
       - '--providers.docker.constraints=Label("radius.stack","true")'
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.websecure.address=:9443"
+      - "--entryPoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
     ports:
       - "9443:9443"
     volumes:
@@ -624,6 +627,14 @@ generate_docker_compose() {
       - "./traefik/certs:/etc/traefik/certs:ro"
     networks:
       - radius-internal
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 EOF
         compose_db_service
@@ -632,6 +643,7 @@ EOF
         compose_api_service
         cat <<'EOF'
     labels:
+      - "autoheal=true"
       - "radius.stack=true"
       - "traefik.docker.network=radius-internal"
       - "traefik.enable=true"
@@ -690,6 +702,8 @@ compose_db_service() {
       interval: 20s
       timeout: 5s
       retries: 3
+    labels:
+      - "autoheal=true"
     networks:
       - radius-internal
 EOF
@@ -721,6 +735,8 @@ compose_api_service() {
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - radius-internal
+    # The image ships its own HEALTHCHECK (wget /api/healthy), so the label
+    # alone is enough for autoheal to act on it.
 EOF
 }
 
@@ -743,6 +759,13 @@ compose_server_service() {
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
+    # Labelled for autoheal, but with no healthcheck it stays inert: freeradius
+    # exposes no probe this installer can trust, and a wrong one would have
+    # autoheal restarting a healthy RADIUS server in a loop. A real check means
+    # a Status-Server probe with the server's own secret, which belongs to the
+    # image, not here.
+    labels:
+      - "autoheal=true"
     networks:
       - radius-internal
 EOF
@@ -750,6 +773,34 @@ EOF
 
 compose_volumes_and_networks() {
     cat <<'EOF'
+  # Restarts any container above whose healthcheck reports unhealthy —
+  # the failure restart: unless-stopped cannot see, because that one only
+  # reacts to a process that exits. Same service the production stack runs.
+  autoheal:
+    image: ${AUTOHEAL_IMAGE:-willfarrell/autoheal}:${AUTOHEAL_VERSION:-latest}
+    container_name: netconfig_radius_autoheal
+    cpus: ${AUTOHEAL_CPU_LIMIT:-0.5}
+    mem_limit: ${AUTOHEAL_MEM_LIMIT:-128m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${RADIUS_LOG_MAX_SIZE:-10m}"
+        max-file: "${RADIUS_LOG_MAX_FILE:-5}"
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=${AUTOHEAL_INTERVAL:-30}
+      - AUTOHEAL_START_PERIOD=${AUTOHEAL_START_PERIOD:-300}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      # Read-write on purpose: restarting a container is a write. It is also
+      # root-equivalent on this host, which is why nothing else in this stack
+      # gets the socket unrestricted.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+    restart: unless-stopped
+    networks:
+      - radius-internal
+
 volumes:
   radius-db-data:
 

@@ -135,6 +135,38 @@ Os limites vivem no `docker-compose.yml`, entao chegam a uma instalacao ja
 existente somente quando o instalador roda de novo — o `update.sh` nao reescreve
 o compose.
 
+## Reinicio automatico (autoheal)
+
+O stack inclui o container `netconfig_radius_autoheal`, o mesmo usado em
+producao. Ele observa os containers marcados com `autoheal=true` e reinicia
+aquele cujo healthcheck passar para `unhealthy` — a falha que o
+`restart: unless-stopped` nao enxerga, porque aquele so reage a processo que
+termina.
+
+| Container | Healthcheck | Autoheal atua? |
+| --- | --- | --- |
+| `netconfig_radius_db` | `mysqladmin ping` (no compose) | Sim |
+| `netconfig_radius_api` | `wget /api/healthy` (na propria imagem) | Sim |
+| `netconfig_radius_traefik` | `/ping` num entrypoint interno `:8082` | Sim |
+| `netconfig_radius_server` | nenhum | Nao — ver abaixo |
+
+O `radius-server` recebe a label, mas fica inerte por decisao: o freeradius nao
+expoe uma verificacao em que este instalador possa confiar, e um healthcheck
+errado faria o autoheal reiniciar em laco um servidor RADIUS saudavel. A
+verificacao correta e um probe `Status-Server` com o segredo do proprio
+servidor, o que pertence a imagem e nao ao instalador.
+
+O `/ping` do Traefik fica num entrypoint que **nao** e publicado no host: de
+fora, na `9443`, esse caminho responde 404.
+
+Ajuste por `.env`: `AUTOHEAL_IMAGE`, `AUTOHEAL_VERSION`, `AUTOHEAL_INTERVAL`
+(padrao `30`), `AUTOHEAL_START_PERIOD` (padrao `300`), `AUTOHEAL_CPU_LIMIT`
+(`0.5`) e `AUTOHEAL_MEM_LIMIT` (`128m`).
+
+O autoheal monta o socket do Docker em leitura e escrita, porque reiniciar
+container e escrita — o que equivale a root nessa maquina. E o unico container
+do stack com esse acesso.
+
 ## Como funciona o acesso HTTPS
 
 - O HTTPS e aplicado no acesso externo da API pelo Traefik (`9443/tcp`).
