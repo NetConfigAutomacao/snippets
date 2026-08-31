@@ -68,10 +68,19 @@ curl -fsSL https://raw.githubusercontent.com/NetConfigAutomacao/snippets/refs/he
 | `SFTP_PORT` | `7777` | Porta SFTP publicada. |
 | `SFTP_API_PORT` | `7770` | Porta da API de controle publicada. |
 | `SFTP_API_IMAGE` | imagem oficial | Sobrescreve a imagem da API de controle. |
+| `TRAEFIK_VERSION` | `v3.6.1` | Tag da imagem do Traefik. |
 | `SFTP_BIND_ADDRESS` | vazio (todas) | Endereco em que as portas publicadas escutam. Perguntado interativamente quando nao definido. |
 | `SFTP_API_IMAGE_URL` | vazio | URL de um tarball `docker save` para carregar a imagem em vez de puxar de um registry. |
 | `SFTP_DOMAIN` | vazio | Dominio para emitir um certificado Let's Encrypt (senao, autoassinado). |
 | `SFTP_ACME_EMAIL` | `admin@<dominio>` | Contato da conta Let's Encrypt. |
+| `SFTP_LOG_MAX_SIZE` | `10m` | Tamanho de cada arquivo de log dos containers antes de rotacionar. |
+| `SFTP_LOG_MAX_FILE` | `5` | Quantos arquivos de log rotacionados guardar. |
+| `SFTP_TRAEFIK_CPU_LIMIT` / `SFTP_TRAEFIK_MEM_LIMIT` | `1` / `512m` | Teto de CPU e memoria do Traefik. |
+| `SFTP_SERVER_CPU_LIMIT` / `SFTP_SERVER_MEM_LIMIT` | `1` / `512m` | Teto de CPU e memoria do servidor SFTP. |
+| `SFTP_API_CPU_LIMIT` / `SFTP_API_MEM_LIMIT` | `1` / `512m` | Teto de CPU e memoria da API de controle. |
+| `AUTOHEAL_INTERVAL` | `30` | Segundos entre as verificacoes do autoheal. |
+| `AUTOHEAL_START_PERIOD` | `300` | Carencia, em segundos, antes do autoheal agir apos subir o stack. |
+| `AUTOHEAL_CPU_LIMIT` / `AUTOHEAL_MEM_LIMIT` | `0.5` / `128m` | Teto de CPU e memoria do autoheal. |
 
 As duas credenciais sao lidas do **ambiente**, nunca de flags: um argumento de linha de comando aparece no historico do shell e na lista de processos da maquina inteira.
 
@@ -106,11 +115,12 @@ SFTP_PORT=9001 SFTP_API_PORT=9002 sudo -E sftp/install.sh --unattended
     dynamic/            # configuracao de TLS do Traefik
 ```
 
-Tres containers:
+Quatro containers:
 
 - **netconfig-sftp-traefik** — termina o TLS da API de controle. So a API passa por ele; o SFTP nao.
 - **netconfig-sftp-server** — OpenSSH servindo os arquivos. Um unico usuario compartilhado (`netconfig`); os arquivos ficam direto em `data/` e o acesso e feito pela senha do SFTP e por links publicos.
 - **netconfig-sftp-api** — a API de controle que o NetConfig usa para listar, renomear, publicar e importar. Nunca serve o arquivo em si.
+- **netconfig-sftp-autoheal** — reinicia qualquer container do stack cujo healthcheck ficar *unhealthy*. O `restart: unless-stopped` so cobre processo que morre; este cobre o que fica de pe e para de responder. Mesmo servico que os stacks do agente e do RADIUS rodam.
 
 Os arquivos ficam num volume Docker (`sftp-data`) que os dois compartilham. O estado da API fica num volume separado (`sftp-api-state`), de proposito: qualquer coisa dentro de `sftp-data` e baixavel por quem tiver a senha do SFTP.
 

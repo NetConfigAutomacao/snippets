@@ -44,7 +44,7 @@ UPDATE_HOUR="-1"
 UPDATE_MINUTE="-1"
 COMPOSE_MODE=""
 SFTP_TAG="latest"
-TRAEFIK_VERSION="v3.3.4"
+TRAEFIK_VERSION="${TRAEFIK_VERSION:-v3.6.1}"
 
 # Read from the environment so the caller (NetConfig's installer, which
 # generates them) never has to put a credential on the command line, where it
@@ -180,26 +180,81 @@ validate_port() {
 # Port Checks
 # =============================================================================
 
-# port_in_use reports whether anything is already listening, EXCEPT this
-# installation's own containers — a --reinstall would otherwise refuse the
-# ports it is about to release.
-port_in_use() {
+# socket_listener_exists answers only "is something listening on this port",
+# with no idea of what. The docker functions below are what tell our own
+# containers apart from a stranger's.
+socket_listener_exists() {
     local port="$1"
 
     if command_exists ss; then
-        ss -ltnH "sport = :$port" 2>/dev/null | grep -q . || return 1
+        ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q .
     elif command_exists netstat; then
-        netstat -ltn 2>/dev/null | grep -q "[:.]$port " || return 1
+        netstat -ltn 2>/dev/null | grep -q "[:.]$port "
     else
-        # No tool to check with: let Docker be the one to refuse, rather than
+        # No tool to ask with: let Docker be the one to refuse, rather than
         # blocking an install on a question we could not ask.
         return 1
     fi
+}
 
-    docker ps --filter "name=netconfig-sftp" --format '{{.Ports}}' 2>/dev/null |
-        grep -q ":$port->" && return 1
+is_managed_container_name() {
+    case "$1" in
+        netconfig-sftp-traefik|netconfig-sftp-server|netconfig-sftp-api|netconfig-sftp-autoheal) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-    return 0
+# Matched on the HOST side of the mapping only. The container port is not the
+# same number -- the SFTP server publishes 22 as $SFTP_PORT -- so anchoring on
+# it, as a symmetric mapping would let you, would never match here.
+docker_container_uses_host_port() {
+    local container_name="$1"
+    local port="$2"
+
+    docker port "$container_name" 2>/dev/null |
+        grep -Eq "^[0-9]+/tcp[[:space:]]*->[[:space:]].*:${port}\$"
+}
+
+# Prints "managed" when one of this installation's own containers publishes the
+# port, "unmanaged" when someone else's container does, nothing when no
+# container does.
+docker_container_publishing_port() {
+    local port="$1"
+    local container_name
+
+    command_exists docker || return 0
+
+    for container_name in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if docker_container_uses_host_port "$container_name" "$port"; then
+            if is_managed_container_name "$container_name"; then
+                printf '%s\n' "managed"
+            else
+                printf '%s\n' "unmanaged"
+            fi
+            return 0
+        fi
+    done
+}
+
+# $2 is the remediation to print, because the answer differs per port: two of
+# them are the operator's to choose, and 80 is not.
+assert_port_available() {
+    local port="$1"
+    local hint="$2"
+    local owner
+
+    owner=$(docker_container_publishing_port "$port")
+
+    case "$owner" in
+        # Ours, and a --reinstall is about to release it. Anything the socket
+        # check would say here is this same container.
+        managed) return 0 ;;
+        unmanaged) die "Port $port is already in use by another Docker container. Stop it, or ${hint}" ;;
+    esac
+
+    if socket_listener_exists "$port"; then
+        die "Port $port is already in use on this host. Stop the conflicting service, or ${hint}"
+    fi
 }
 
 validate_required_ports() {
@@ -216,11 +271,13 @@ validate_required_ports() {
         log_warn "SFTP_PORT 2222 collides with the NetConfig Agent's SSH tunnel."
     fi
 
-    if port_in_use "$SFTP_PORT"; then
-        die "Port $SFTP_PORT is already in use. Set SFTP_PORT to a free port."
-    fi
-    if port_in_use "$SFTP_API_PORT"; then
-        die "Port $SFTP_API_PORT is already in use. Set SFTP_API_PORT to a free port."
+    assert_port_available "$SFTP_PORT" "set SFTP_PORT to a free port."
+    assert_port_available "$SFTP_API_PORT" "set SFTP_API_PORT to a free port."
+
+    # Only with a domain: that is what puts Traefik on :80 for the ACME
+    # HTTP-01 challenge. Without one, nothing here wants port 80.
+    if [ -n "$SFTP_DOMAIN" ]; then
+        assert_port_available 80 "install without --domain (the certificate stays self-signed)."
     fi
 }
 
@@ -261,6 +318,16 @@ Environment:
                    Address the published ports listen on (default: every
                    interface). Asked interactively when not set.
   SFTP_API_IMAGE   Override the control API image.
+  TRAEFIK_VERSION  Tag of the Traefik image (default: v3.6.1).
+  SFTP_LOG_MAX_SIZE, SFTP_LOG_MAX_FILE
+                   Docker log rotation for every container (default: 10m, 5).
+  SFTP_TRAEFIK_CPU_LIMIT, SFTP_TRAEFIK_MEM_LIMIT, SFTP_SERVER_CPU_LIMIT,
+  SFTP_SERVER_MEM_LIMIT, SFTP_API_CPU_LIMIT, SFTP_API_MEM_LIMIT
+                   Per-container CPU and memory ceilings (default: 1, 512m).
+  AUTOHEAL_INTERVAL, AUTOHEAL_START_PERIOD, AUTOHEAL_CPU_LIMIT,
+  AUTOHEAL_MEM_LIMIT
+                   Tuning for the autoheal container that restarts an unhealthy
+                   one (default: 30, 300, 0.5, 128m).
   SFTP_API_IMAGE_URL  Load the control API image from a `docker save` tarball at
                    this URL instead of pulling it. For boxes with no route to a
                    registry.
@@ -753,6 +820,13 @@ services:
   traefik:
     image: "traefik:${TRAEFIK_VERSION}"
     container_name: netconfig-sftp-traefik
+    cpus: ${SFTP_TRAEFIK_CPU_LIMIT:-1}
+    mem_limit: ${SFTP_TRAEFIK_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${SFTP_LOG_MAX_SIZE:-10m}"
+        max-file: "${SFTP_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -764,6 +838,9 @@ services:
     command:
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--entryPoints.websecure.address=:${SFTP_API_PORT}"
+      - "--entryPoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
     ports:
       - "__BIND__${SFTP_API_PORT}:${SFTP_API_PORT}"
     volumes:
@@ -771,10 +848,25 @@ services:
       - "./traefik/certs:/etc/traefik/certs:ro"
     networks:
       - sftp-internal
+    labels:
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   sftp-server:
     image: atmoz/sftp:alpine
     container_name: netconfig-sftp-server
+    cpus: ${SFTP_SERVER_CPU_LIMIT:-1}
+    mem_limit: ${SFTP_SERVER_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${SFTP_LOG_MAX_SIZE:-10m}"
+        max-file: "${SFTP_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     environment:
       # One shared user by design: this instance serves a single enterprise,
@@ -786,12 +878,26 @@ services:
       - sftp-data:/home/netconfig/data
     ports:
       - "__BIND__${SFTP_PORT}:22"
+    # Labelled for autoheal, but inert until it has a healthcheck: sshd exposes
+    # no probe this installer can trust, and a wrong one would have autoheal
+    # restarting a healthy server -- dropping the transfers in flight -- in a
+    # loop. A real check means an SFTP login with the user's own password,
+    # which belongs to the image, not here.
+    labels:
+      - "autoheal=true"
     networks:
       - sftp-internal
 
   sftp-api:
     image: "${SFTP_API_IMAGE}:${SFTP_TAG}"
     container_name: netconfig-sftp-api
+    cpus: ${SFTP_API_CPU_LIMIT:-1}
+    mem_limit: ${SFTP_API_MEM_LIMIT:-512m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${SFTP_LOG_MAX_SIZE:-10m}"
+        max-file: "${SFTP_LOG_MAX_FILE:-5}"
     restart: unless-stopped
     depends_on:
       - sftp-server
@@ -812,6 +918,41 @@ services:
       - sftp-api-state:/state
       # Needed only to rotate the SFTP user's password in the server container.
       - /var/run/docker.sock:/var/run/docker.sock
+    # Labelled for autoheal, without a healthcheck for now: the API answers
+    # /api/healthy, but the check runs INSIDE this image and there is no
+    # guarantee it ships wget or curl -- a check that cannot run reports
+    # unhealthy, and autoheal would restart a working API forever. Add it here
+    # once the image is known to carry one of them.
+    labels:
+      - "autoheal=true"
+    networks:
+      - sftp-internal
+
+  # Restarts any container above whose healthcheck reports unhealthy -- the
+  # failure restart: unless-stopped cannot see, because that one only reacts to
+  # a process that exits, not to one that stays up and stops answering. Same
+  # service the agent and RADIUS stacks run.
+  autoheal:
+    image: ${AUTOHEAL_IMAGE:-willfarrell/autoheal}:${AUTOHEAL_VERSION:-latest}
+    container_name: netconfig-sftp-autoheal
+    cpus: ${AUTOHEAL_CPU_LIMIT:-0.5}
+    mem_limit: ${AUTOHEAL_MEM_LIMIT:-128m}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${SFTP_LOG_MAX_SIZE:-10m}"
+        max-file: "${SFTP_LOG_MAX_FILE:-5}"
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=${AUTOHEAL_INTERVAL:-30}
+      - AUTOHEAL_START_PERIOD=${AUTOHEAL_START_PERIOD:-300}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      # Read-write on purpose: restarting a container is a write. It is also
+      # root-equivalent on this host.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/etc/localtime:/etc/localtime:ro"
+    restart: unless-stopped
     networks:
       - sftp-internal
 
@@ -880,6 +1021,23 @@ detect_compose_mode() {
     printf '%s\n' "ERROR_COMPOSE_NOT_FOUND" >&2
     return 1
 }
+
+# A lock directory, because mkdir is the one atomic create-if-absent every
+# shell has: cron and an operator running this by hand must not pull and
+# recreate the containers at the same time. The trap releases it on every exit
+# short of a kill -9; after one of those, remove it by hand.
+UPDATE_LOCK_DIR="$SFTP_DIR/.update.lock"
+
+cleanup() {
+    rmdir "$UPDATE_LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+if ! mkdir "$UPDATE_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "Another NetConfig SFTP update is already running." >&2
+    exit 0
+fi
+
+trap cleanup EXIT INT TERM
 
 COMPOSE=$(detect_compose_mode)
 cd "$SFTP_DIR"
