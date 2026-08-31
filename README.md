@@ -8,9 +8,11 @@ Coleção de scripts e utilitários mantidos pela equipe NetConfig.Automaçao.
 - **Radius Installer** – automatiza a instalação do NetConfig Radius (Traefik + MySQL + radius-api + radius-server).
 - **SFTP Manager Installer** – automatiza a instalação do repositório de arquivos de onde os equipamentos buscam atualizações e licenças (sftp-server + sftp-api).
 
-Veja a documentação completa em [`agent/README.md`](agent/README.md).
-Veja a documentação completa em [`radius/README.md`](radius/README.md).
-Veja a documentação completa em [`sftp/README.md`](sftp/README.md).
+Veja a documentação completa do Agent em [`agent/README.md`](agent/README.md).
+
+Veja a documentação completa do Radius em [`radius/README.md`](radius/README.md).
+
+Veja a documentação completa do SFTP Manager em [`sftp/README.md`](sftp/README.md).
 
 ## Outros componentes
 
